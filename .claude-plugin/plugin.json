@@ -1,0 +1,10 @@
+{
+  "name": "cmux-claude-code-skill",
+  "description": "Claude Code skill for cmux — the native macOS terminal built on Ghostty. Gives Claude native understanding of cmux CLI, socket API, browser automation, notifications, sidebar metadata, and split pane workflows.",
+  "author": {
+    "name": "Stealinglight"
+  },
+  "version": "1.0.0",
+  "license": "MIT",
+  "keywords": ["cmux", "terminal", "ghostty", "browser-automation", "macos"]
+}
