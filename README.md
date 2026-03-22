@@ -50,6 +50,21 @@ Updates pull automatically when the marketplace syncs. To update manually:
 /plugin marketplace update Stealinglight-cmux-claude-code-skill
 ```
 
+## Agent Teams Setup (Optional)
+
+To use Claude Code's [Agent Teams](https://docs.anthropic.com/en/docs/claude-code/agent-teams) with cmux's native split panes instead of tmux, add this to your `~/.zshrc`:
+
+```bash
+# cmux Agent Teams integration
+if [[ -n "${CMUX_SURFACE_ID:-}" ]]; then
+    _cmux_setup=$(find ~/.claude/plugins/cache -path "*cmux*/bin/cmux-agent-teams-setup" 2>/dev/null | head -1)
+    [[ -n "$_cmux_setup" ]] && eval "$($_cmux_setup)"
+    unset _cmux_setup
+fi
+```
+
+This sets up a tmux shim that translates tmux commands to cmux equivalents, enabling agent teams to create native cmux split panes for each teammate. Restart your terminal after adding.
+
 ## What Claude Learns
 
 Once installed, Claude Code automatically activates this skill when you mention cmux, browser debugging, terminal automation, or related topics. The skill is **action-oriented** — it gives Claude step-by-step protocols, not just reference documentation.
