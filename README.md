@@ -1,6 +1,6 @@
 # cmux Claude Code Skill
 
-> Give Claude Code native control of [cmux](https://cmux.dev) — browser automation, split panes, notifications, and sidebar metadata for the Ghostty-powered macOS terminal.
+> Give Claude Code native control of [cmux](https://cmux.dev) — open browser tiles, spawn agents in splits, manage workspaces, automate the embedded Chromium browser, and coordinate worktree-based parallel development.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Claude Code](https://img.shields.io/badge/Claude_Code-Plugin-blueviolet)](https://docs.anthropic.com/en/docs/claude-code)
@@ -15,9 +15,12 @@ When you run Claude Code inside [cmux](https://cmux.dev), Claude has no idea it'
 **This skill changes that.** Install it, and Claude can:
 
 - Open a browser pane next to your terminal and debug your web app visually
+- Spawn other Claude Code agents in new tiles for parallel work
+- Create git worktrees and run isolated agents on feature branches
 - Send you a notification when a long task finishes
 - Show build progress in the sidebar without cluttering your terminal
 - Automate browser interactions — click, fill, screenshot, inspect — all from the CLI
+- Use Playwright MCP or Chrome DevTools MCP to drive the embedded Chromium browser
 
 It turns cmux from "a nice terminal" into an integrated development environment that Claude actually knows how to use.
 
@@ -49,73 +52,63 @@ git clone https://github.com/Stealinglight/cmux-claude-code-skill.git
 
 ## What Claude Learns
 
-Once installed, Claude Code automatically activates this skill when you mention cmux, browser debugging, terminal automation, or related topics. Here's what it gains:
+Once installed, Claude Code automatically activates this skill when you mention cmux, browser debugging, terminal automation, or related topics. The skill is **action-oriented** — it gives Claude step-by-step protocols, not just reference documentation.
 
-### Terminal & Workspace Management
+### Open a Browser Tile
 
-Claude can create workspaces, split panes, send commands to specific surfaces, and navigate between them — all programmatically.
-
-```bash
-# Claude can split your workspace and run commands in parallel
-cmux new-split right
-cmux send-surface --surface surface:2 "npm run dev\n"
-```
-
-### Browser Automation for Debugging
-
-This is the headline feature. Claude can open a browser pane right next to your terminal, navigate to your dev server, and debug interactively:
+Claude can open a browser pane right next to your terminal and debug interactively:
 
 ```bash
 # Open your app in a split browser pane
 cmux browser open-split http://localhost:3000
 
-# Wait for it to load, then inspect the page
+# Wait for load, inspect, interact
 cmux browser surface:2 wait --load-state complete --timeout-ms 15000
 cmux browser surface:2 snapshot --interactive --compact
-
-# Fill a form and verify the result
 cmux browser surface:2 fill "#email" --text "test@example.com"
 cmux browser surface:2 click "button[type='submit']" --snapshot-after
-cmux browser surface:2 wait --text "Welcome"
-
-# Grab a screenshot for reference
 cmux browser surface:2 screenshot --out /tmp/debug.png
 ```
 
-No need to switch to Chrome DevTools. No need to describe what you see on screen. Claude can see and interact with your web app directly.
+The embedded browser is full Chromium — Claude can also use **Playwright MCP** or **Chrome DevTools MCP** for advanced automation.
 
-### Notifications When Tasks Complete
+### Spawn Agents in New Tiles
 
-Never wonder "is Claude done yet?" again. With the included hook integration, Claude notifies you through cmux's notification system:
+Claude can create split panes and launch other Claude Code instances for parallel work:
 
 ```bash
-# Simple notification from any script
-cmux notify --title "Build Complete" --body "All 42 tests passed"
-
-# Or use OSC 777 escape codes from any language
-printf '\e]777;notify;Task Done;Ready for review\a'
+# Create a split and send a new Claude agent to it
+cmux new-split right
+NEW_SURFACE=$(cmux list-surfaces --json | jq -r '.surfaces[-1].id')
+cmux send-surface --surface "$NEW_SURFACE" "claude \"Run all tests and fix failures\"\n"
 ```
 
-The skill includes a ready-to-use Claude Code hook script that sends notifications on session completion and agent task finish. Just drop it in `~/.claude/hooks/`.
+### Worktree + Agent Tiles
 
-### Sidebar Status & Progress
-
-Surface build state without terminal noise. Claude can set status pills, progress bars, and log entries in the cmux sidebar:
+Combine git worktrees with cmux for isolated parallel development:
 
 ```bash
-# Show what's happening at a glance
+# Create a worktree, open a workspace, launch an agent
+git worktree add /tmp/wt-feature -b feature/new-thing
+cmux new-workspace
+cmux send "cd /tmp/wt-feature && claude \"Implement the feature\"\n"
+```
+
+### Notifications & Sidebar
+
+```bash
+# Notify when tasks finish
+cmux notify --title "Build Complete" --body "All 42 tests passed"
+
+# Show progress in sidebar
 cmux set-status build "compiling" --icon hammer --color "#ff9500"
 cmux set-progress 0.5 --label "Building..."
 cmux log --level success -- "All tests passed"
-
-# Clean up when done
-cmux set-status build "done" --icon checkmark --color "#30d158"
-cmux clear-progress
 ```
 
 ### Full Socket API Access
 
-Every cmux command is available through both CLI and Unix socket. Claude knows both interfaces and can write automation scripts in Python or shell:
+Every cmux command is available through both CLI and Unix socket. Claude knows both interfaces:
 
 ```python
 import json, os, socket
@@ -136,30 +129,32 @@ rpc("notification.create", {"title": "Done", "body": "From Python!"})
 
 ```
 skills/cmux/
-├── SKILL.md                          # Core skill — concepts, essential commands, workflows
+├── SKILL.md                          # Core skill — action protocols, env detection, browser, agents
 └── references/
     ├── api-reference.md              # Complete CLI + socket API (every command)
     ├── browser-automation.md         # Full browser automation reference
+    ├── agent-patterns.md             # Agent spawning, worktree patterns, multi-agent orchestration
     └── keyboard-shortcuts.md         # All keyboard shortcuts by category
 ```
 
 | File | Coverage |
 |---|---|
-| **SKILL.md** | Hierarchy, detection, CLI quick-reference, browser essentials, notifications, sidebar metadata, Claude Code integration patterns |
-| **api-reference.md** | Socket connection, workspace/surface/input/notification/sidebar commands, environment variables, Python + shell examples |
+| **SKILL.md** | Environment detection, Bash tool directives, action protocols (browser tiles, agent spawning, worktrees, workspaces, splits, notifications, sidebar), browser MCP integration, quick reference |
+| **api-reference.md** | Socket connection, workspace/surface/input/notification/sidebar commands, environment variables, configuration, Python + shell examples |
 | **browser-automation.md** | Navigation, waiting, DOM interaction, inspection, JS eval, cookies/storage, tabs, console, dialogs, frames, downloads, common patterns |
+| **agent-patterns.md** | Single/multi-agent spawning, worktree lifecycle, agent communication, Claude Code hooks, safety considerations, parallel development examples |
 | **keyboard-shortcuts.md** | Workspaces, surfaces, split panes, browser, notifications, find, terminal, window shortcuts |
 
 ## How It Works
 
 Claude Code skills are markdown files that Claude automatically loads when relevant triggers match in your conversation. This skill activates when you mention:
 
-- cmux, cmux browser, cmux API
-- Split panes, terminal automation
-- Browser debugging in cmux
+- cmux, browser tile, split pane, spawn agent
+- Browser debugging, terminal automation
+- Workspaces, worktree tiles
 - Notifications, sidebar status
 
-The `SKILL.md` file provides the core knowledge (~1,000 words, loads fast), with three reference files available for deep dives into specific command categories.
+The `SKILL.md` file provides action-oriented protocols that tell Claude exactly how to execute cmux operations via the Bash tool, with reference files available for deep dives.
 
 ## Requirements
 

@@ -1,6 +1,6 @@
 # cmux API Reference
 
-Complete CLI and socket API reference for cmux.
+Complete CLI and socket API reference for cmux. The main `SKILL.md` covers essential commands and action protocols. Consult this file for the full command set, socket API details, advanced flags, and configuration.
 
 ## Socket Connection
 
@@ -378,4 +378,33 @@ if [ $? -eq 0 ]; then
 else
     cmux notify --title "Build Failed" --body "Check the logs"
 fi
+```
+
+---
+
+## Configuration
+
+cmux reads Ghostty config from `~/.config/ghostty/config` or `~/Library/Application Support/com.mitchellh.ghostty/config`.
+
+```ini
+font-family = JetBrains Mono
+font-size = 14
+theme = Dracula
+scrollback-limit = 10000
+unfocused-split-opacity = 0.7
+```
+
+App settings via `Cmd+,`: theme mode, automation/socket access level, browser link behavior.
+
+### tmux passthrough
+
+If using tmux inside cmux, enable passthrough for notifications:
+
+```
+# .tmux.conf
+set -g allow-passthrough on
+```
+
+```bash
+printf '\ePtmux;\e\e]777;notify;Title;Body\a\e\\'
 ```
