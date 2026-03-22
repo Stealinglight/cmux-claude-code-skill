@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+# cmux-tmux-shim: Intercepts tmux commands and translates them to cmux equivalents
+# when running inside cmux. Falls through to real tmux when not in cmux.
+#
+# This enables Claude Code Agent Teams split-pane mode to work natively
+# with cmux's pane management instead of requiring tmux.
+#
+# Install: Add this directory to PATH before /opt/homebrew/bin
+#   export PATH="/path/to/cmux-claude-code-skill/bin:$PATH"
+
+set -euo pipefail
+
+# ── Config ──────────────────────────────────────────────────────────────────
+REAL_TMUX=""
+SHIM_DEBUG="${CMUX_TMUX_SHIM_DEBUG:-0}"
+
+debug() {
+    [[ "$SHIM_DEBUG" == "1" ]] && echo "[cmux-tmux-shim] $*" >&2 || true
+}
+
+# Find the real tmux binary, skipping our own directory
+find_real_tmux() {
+    local self_dir
+    self_dir="$(cd "$(dirname "$0")" && pwd)"
+    IFS=: read -ra dirs <<< "$PATH"
+    for d in "${dirs[@]}"; do
+        [[ "$d" == "$self_dir" ]] && continue
+        [[ -x "$d/tmux" ]] && REAL_TMUX="$d/tmux" && return 0
+    done
+    return 1
+}
+
+# ── Detect cmux ─────────────────────────────────────────────────────────────
+is_in_cmux() {
+    [[ -n "${CMUX_SURFACE_ID:-}" ]] && command -v cmux &>/dev/null
+}
+
+# ── Passthrough to real tmux ────────────────────────────────────────────────
+passthrough() {
+    find_real_tmux || { echo "tmux: real tmux binary not found" >&2; exit 1; }
+    debug "passthrough: $REAL_TMUX $*"
+    exec "$REAL_TMUX" "$@"
+}
+
+# ── If not in cmux, always passthrough ──────────────────────────────────────
+if ! is_in_cmux; then
+    passthrough "$@"
+fi
+
+debug "intercepting: tmux $*"
+
+# ── Strip -L <socket> flag (cmux doesn't need it) ──────────────────────────
+ARGS=()
+skip_next=0
+for arg in "$@"; do
+    if [[ $skip_next -eq 1 ]]; then
+        skip_next=0
+        continue
+    fi
+    if [[ "$arg" == "-L" ]]; then
+        skip_next=1
+        continue
+    fi
+    ARGS+=("$arg")
+done
+set -- "${ARGS[@]}"
+
+# ── Parse the tmux subcommand ───────────────────────────────────────────────
+CMD="${1:-}"
+shift || true
+
+case "$CMD" in
+
+    # ── Version check (agent teams uses this for availability) ──────────
+    -V)
+        # Report as tmux 3.4 to pass version checks
+        echo "tmux 3.4"
+        exit 0
+        ;;
+
+    # ── split-window: create a new pane ─────────────────────────────────
+    split-window)
+        direction="right"
+        target=""
+        print_format=0
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -h) direction="right"; shift ;;
+                -v) direction="down"; shift ;;
+                -t) target="$2"; shift 2 ;;
+                -P) print_format=1; shift ;;
+                -F) shift 2 ;;  # skip format string, we return our own ID
+                *) shift ;;
+            esac
+        done
+        debug "split-window: direction=$direction target=$target"
+        output=$(cmux new-split "$direction" 2>&1)
+        # Output format: "OK surface:27 workspace:10"
+        surface_ref=$(echo "$output" | awk '{print $2}')
+        if [[ $print_format -eq 1 ]]; then
+            # Agent teams expects a pane ID like %42 — we return the surface ref
+            echo "$surface_ref"
+        fi
+        exit 0
+        ;;
+
+    # ── send-keys: send text/commands to a pane ─────────────────────────
+    send-keys)
+        target=""
+        keys=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -t) target="$2"; shift 2 ;;
+                Enter) keys+=("\n"); shift ;;
+                *) keys+=("$1"); shift ;;
+            esac
+        done
+        text="${keys[*]}"
+        debug "send-keys: target=$target text=${text:0:60}..."
+        if [[ -n "$target" ]]; then
+            cmux send --surface "$target" "$text" 2>/dev/null
+        else
+            cmux send "$text" 2>/dev/null
+        fi
+        exit 0
+        ;;
+
+    # ── select-pane: focus or style a pane ──────────────────────────────
+    select-pane)
+        target=""
+        title=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -t) target="$2"; shift 2 ;;
+                -T) title="$2"; shift 2 ;;
+                -P) shift ;;  # style string — cmux handles this differently
+                *) shift ;;
+            esac
+        done
+        debug "select-pane: target=$target title=$title"
+        if [[ -n "$title" && -n "$target" ]]; then
+            # Rename the surface/tab
+            cmux rename-tab --surface "$target" "$title" 2>/dev/null || true
+        elif [[ -n "$target" ]]; then
+            cmux focus-pane --pane "$target" 2>/dev/null || true
+        fi
+        exit 0
+        ;;
+
+    # ── list-panes: list panes in a window/workspace ────────────────────
+    list-panes)
+        target=""
+        format=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -t) target="$2"; shift 2 ;;
+                -F) format="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        debug "list-panes: target=$target format=$format"
+        # Agent teams uses -F "#{pane_id}" to get pane IDs
+        # Return surface refs, one per line
+        cmux list-pane-surfaces 2>/dev/null | while read -r line; do
+            # Lines like: "* surface:12  ⠐ some-name  [selected]"
+            ref=$(echo "$line" | grep -oE 'surface:[0-9]+' | head -1)
+            [[ -n "$ref" ]] && echo "$ref"
+        done
+        exit 0
+        ;;
+
+    # ── kill-pane: close a surface ──────────────────────────────────────
+    kill-pane)
+        target=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -t) target="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        debug "kill-pane: target=$target"
+        if [[ -n "$target" ]]; then
+            cmux close-surface --surface "$target" 2>/dev/null
+        fi
+        exit 0
+        ;;
+
+    # ── resize-pane: resize a pane ──────────────────────────────────────
+    resize-pane)
+        target=""
+        resize_args=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -t) target="$2"; shift 2 ;;
+                -x|-y) shift 2 ;;  # cmux handles layout differently
+                -L|-R|-U|-D) resize_args+=("$1"); shift ;;
+                *) shift ;;
+            esac
+        done
+        debug "resize-pane: target=$target (cmux auto-layouts)"
+        # cmux has resize-pane but layout is mostly automatic
+        if [[ -n "$target" && ${#resize_args[@]} -gt 0 ]]; then
+            cmux resize-pane --pane "$target" "${resize_args[@]}" 2>/dev/null || true
+        fi
+        exit 0
+        ;;
+
+    # ── set-option: window/pane options ─────────────────────────────────
+    set-option)
+        # cmux handles pane styling natively — absorb these silently
+        debug "set-option: $* (absorbed)"
+        exit 0
+        ;;
+
+    # ── select-layout: rebalance panes ──────────────────────────────────
+    select-layout)
+        debug "select-layout: $* (cmux auto-layouts)"
+        # cmux manages layout automatically
+        exit 0
+        ;;
+
+    # ── display-message: get pane/session info ──────────────────────────
+    display-message)
+        print_mode=0
+        target=""
+        format_str=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -p) print_mode=1; shift ;;
+                -t) target="$2"; shift 2 ;;
+                *) format_str="$1"; shift ;;
+            esac
+        done
+        debug "display-message: format=$format_str target=$target"
+        if [[ $print_mode -eq 1 ]]; then
+            case "$format_str" in
+                '#{pane_id}')
+                    # Return current surface ref (e.g. surface:12)
+                    # Resolve UUID to ref via identify
+                    ref=$(cmux identify --json 2>/dev/null | grep -oE '"surface_ref" *: *"surface:[0-9]+"' | grep -oE 'surface:[0-9]+' | head -1)
+                    echo "${ref:-surface:0}"
+                    ;;
+                '#{session_name}:#{window_index}')
+                    # Return workspace ref
+                    ref=$(cmux identify --json 2>/dev/null | grep -oE '"workspace_ref" *: *"workspace:[0-9]+"' | grep -oE 'workspace:[0-9]+' | head -1)
+                    echo "cmux:${ref:-workspace:0}"
+                    ;;
+                *)
+                    echo "$format_str"
+                    ;;
+            esac
+        else
+            cmux display-message "$format_str" 2>/dev/null || echo "$format_str"
+        fi
+        exit 0
+        ;;
+
+    # ── new-session: create a new workspace ─────────────────────────────
+    new-session)
+        detached=0
+        session_name=""
+        window_name=""
+        print_format=0
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -d) detached=1; shift ;;
+                -s) session_name="$2"; shift 2 ;;
+                -n) window_name="$2"; shift 2 ;;
+                -P) print_format=1; shift ;;
+                -F) shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        debug "new-session: name=$session_name window=$window_name"
+        output=$(cmux new-workspace 2>&1)
+        # For agent teams external session mode, return a surface ref
+        if [[ $print_format -eq 1 ]]; then
+            surfaces=$(cmux list-pane-surfaces 2>/dev/null | grep -oE 'surface:[0-9]+' | tail -1)
+            echo "${surfaces:-surface:0}"
+        fi
+        exit 0
+        ;;
+
+    # ── has-session: check if session/workspace exists ──────────────────
+    has-session)
+        debug "has-session: $*"
+        # Always succeed — we're in cmux, sessions always exist
+        cmux ping &>/dev/null
+        exit $?
+        ;;
+
+    # ── kill-session: close workspace ───────────────────────────────────
+    kill-session)
+        target=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -t) target="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        debug "kill-session: target=$target"
+        # Don't close workspaces aggressively — agent teams cleanup handles this
+        exit 0
+        ;;
+
+    # ── break-pane: detach pane (used for hide) ─────────────────────────
+    break-pane)
+        debug "break-pane: $* (absorbed — cmux doesn't need pane hiding)"
+        exit 0
+        ;;
+
+    # ── join-pane: reattach pane (used for show) ────────────────────────
+    join-pane)
+        debug "join-pane: $* (absorbed — cmux doesn't need pane showing)"
+        exit 0
+        ;;
+
+    # ── list-windows: list workspaces ───────────────────────────────────
+    list-windows)
+        debug "list-windows: $*"
+        cmux list-workspaces 2>/dev/null
+        exit 0
+        ;;
+
+    # ── new-window: new workspace ───────────────────────────────────────
+    new-window)
+        debug "new-window: $*"
+        cmux new-workspace 2>/dev/null
+        exit 0
+        ;;
+
+    # ── Fallback: pass unknown commands to real tmux ────────────────────
+    *)
+        debug "unhandled command: $CMD $* → passthrough"
+        passthrough "$CMD" "$@"
+        ;;
+esac
