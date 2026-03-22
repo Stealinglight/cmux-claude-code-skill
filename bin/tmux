@@ -13,6 +13,7 @@ set -euo pipefail
 # ── Config ──────────────────────────────────────────────────────────────────
 REAL_TMUX=""
 SHIM_DEBUG="${CMUX_TMUX_SHIM_DEBUG:-0}"
+SPLIT_COUNT_FILE="/tmp/cmux-tmux-shim-split-count"
 
 debug() {
     [[ "$SHIM_DEBUG" == "1" ]] && echo "[cmux-tmux-shim] $*" >&2 || true
@@ -80,7 +81,7 @@ case "$CMD" in
 
     # ── split-window: create a new pane ─────────────────────────────────
     split-window)
-        direction="right"
+        direction=""
         target=""
         print_format=0
         while [[ $# -gt 0 ]]; do
@@ -93,6 +94,16 @@ case "$CMD" in
                 *) shift ;;
             esac
         done
+        # If no explicit direction, alternate right/down for better layout
+        if [[ -z "$direction" ]]; then
+            count=$(cat "$SPLIT_COUNT_FILE" 2>/dev/null || echo 0)
+            if (( count % 2 == 0 )); then direction="right"; else direction="down"; fi
+            echo $(( count + 1 )) > "$SPLIT_COUNT_FILE"
+        else
+            # Track explicit splits too
+            count=$(cat "$SPLIT_COUNT_FILE" 2>/dev/null || echo 0)
+            echo $(( count + 1 )) > "$SPLIT_COUNT_FILE"
+        fi
         debug "split-window: direction=$direction target=$target"
         output=$(cmux new-split "$direction" 2>&1)
         # Output format: "OK surface:27 workspace:10"

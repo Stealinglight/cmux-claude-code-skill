@@ -225,6 +225,64 @@ cmux log --level info "Claude Code session started"
 
 ---
 
+## Claude Code Agent Teams with cmux
+
+Claude Code's experimental Agent Teams feature supports split-pane mode via tmux. This plugin includes a tmux shim that redirects all tmux commands to cmux, so agent teams creates native cmux panes instead.
+
+### Setup
+
+```bash
+# Add to ~/.zshrc or run before starting Claude:
+eval "$(/path/to/cmux-claude-code-skill/bin/cmux-agent-teams-setup)"
+```
+
+This does three things:
+1. Puts the `bin/tmux` shim ahead of real tmux in `$PATH`
+2. Sets `$TMUX=cmux-shim` so Claude Code detects "inside tmux" mode
+3. Enables `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`
+
+### Usage
+
+Start Claude normally, then ask for an agent team:
+
+```
+Create an agent team with 3 teammates:
+- One focused on security review
+- One checking performance impact
+- One validating test coverage
+```
+
+Claude Code creates cmux split panes for each teammate. You get:
+- **Sidebar visibility**: each teammate's workspace shows in the cmux sidebar
+- **Notification rings**: teammates trigger cmux notifications when they need attention
+- **Click to interact**: click any pane to message that teammate directly
+- **Shift+Down**: cycle through teammates in the lead's pane
+
+### How the shim works
+
+The `bin/tmux` script intercepts tmux commands and translates them:
+
+| tmux command | cmux equivalent |
+|---|---|
+| `tmux split-window -h` | `cmux new-split right` |
+| `tmux split-window -v` | `cmux new-split down` |
+| `tmux send-keys -t <pane> <text> Enter` | `cmux send --surface <surface> "text\n"` |
+| `tmux list-panes` | `cmux list-pane-surfaces` |
+| `tmux kill-pane -t <pane>` | `cmux close-surface --surface <surface>` |
+| `tmux display-message -p "#{pane_id}"` | `cmux identify --json` (parse surface ref) |
+| `tmux select-pane -t <pane> -T <title>` | `cmux rename-tab --surface <surface> <title>` |
+| `tmux has-session` | `cmux ping` |
+
+Commands without a cmux equivalent (set-option, select-layout, break-pane) are absorbed silently. When not inside cmux, the shim passes through to the real tmux binary.
+
+### Limitations
+
+- **Layout**: cmux manages layout automatically. The tmux `select-layout tiled` and `main-vertical` commands are absorbed. Pane sizes may not be perfectly balanced.
+- **Pane border styling**: tmux pane border colors and titles translate to cmux tab names. The visual presentation differs from tmux's border styling.
+- **External sessions**: the shim maps tmux `new-session` to `cmux new-workspace`. The semantics differ slightly.
+
+---
+
 ## Example: Parallel Feature Development
 
 Full workflow for developing three features in parallel:

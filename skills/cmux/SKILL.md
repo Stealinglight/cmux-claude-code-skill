@@ -107,6 +107,24 @@ For isolated parallel work combining git worktrees with cmux tiles:
 
 Note: You also have the `EnterWorktree` tool for working in a worktree in YOUR session. Use cmux splits + `send --surface` when you want a SEPARATE agent running in parallel.
 
+### Agent Teams (Split-Pane Mode)
+
+Claude Code Agent Teams can use cmux's native panes instead of tmux. This plugin includes a tmux shim that translates tmux commands to cmux equivalents.
+
+**Setup** (run before starting Claude, or add to `~/.zshrc`):
+```bash
+eval "$(/path/to/cmux-claude-code-skill/bin/cmux-agent-teams-setup)"
+```
+
+This sets `$TMUX`, puts the shim in `$PATH`, and enables agent teams. Then use agent teams normally:
+```
+Create an agent team with 3 teammates to review this PR from different angles
+```
+
+Claude Code will create cmux split panes for each teammate, with full sidebar visibility, notification rings, and workspace integration.
+
+For details, see `references/agent-patterns.md`.
+
 ### Create a Workspace
 
 ```bash
