@@ -1,0 +1,38 @@
+{
+  "name": "Stealinglight-cmux-claude-code-skill",
+  "owner": {
+    "name": "Stealinglight",
+    "url": "https://github.com/Stealinglight"
+  },
+  "metadata": {
+    "description": "Claude Code plugin for cmux — the native macOS terminal built on Ghostty. Browser automation, split panes, agent spawning, Agent Teams support, and sidebar metadata.",
+    "version": "2.0.0",
+    "homepage": "https://github.com/Stealinglight/cmux-claude-code-skill"
+  },
+  "plugins": [
+    {
+      "name": "cmux-claude-code-skill",
+      "source": "./plugins/cmux",
+      "description": "Gives Claude the ability to control cmux: open browser tiles, spawn agents in splits, manage workspaces, automate the embedded WebKit browser, coordinate worktree-based parallel development, send notifications, and update sidebar metadata.",
+      "version": "2.0.0",
+      "author": {
+        "name": "Stealinglight",
+        "url": "https://github.com/Stealinglight"
+      },
+      "category": "terminal",
+      "homepage": "https://github.com/Stealinglight/cmux-claude-code-skill",
+      "keywords": [
+        "cmux",
+        "terminal",
+        "ghostty",
+        "browser-automation",
+        "macos",
+        "agent-spawning",
+        "worktree",
+        "split-pane",
+        "webkit",
+        "agent-teams"
+      ]
+    }
+  ]
+}
