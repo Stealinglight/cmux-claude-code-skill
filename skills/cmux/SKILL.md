@@ -30,9 +30,10 @@ command -v cmux &>/dev/null && echo "CLI=available" || echo "CLI=missing"
 ALL cmux operations use the **Bash tool**. Every command in this skill is meant to be executed via Bash.
 
 - Use `--json` for machine-readable output when you need to parse results
-- After creating any split or surface, run `cmux list-surfaces --json` to capture the new surface ID
+- `cmux new-split` returns `OK surface:<id> workspace:<id>` — parse this to get the new surface ID directly
 - Chain related commands with `&&` for atomicity
-- Always include `\n` at the end of text sent via `send-surface` to execute the command
+- Always include `\n` at the end of text sent via `send --surface` to execute the command
+- Use `cmux list-pane-surfaces` to list surfaces in the current pane
 
 ---
 
@@ -42,16 +43,12 @@ ALL cmux operations use the **Bash tool**. Every command in this skill is meant 
 
 To open a browser pane alongside your terminal:
 
-1. Create the browser split:
+1. Create the browser split (returns the new surface ID):
    ```bash
    cmux browser open-split http://localhost:3000
    ```
-2. Get the new surface ID:
-   ```bash
-   cmux list-surfaces --json
-   ```
-   Parse the JSON output. The new browser surface will have a different ID from your `$CMUX_SURFACE_ID`.
-3. Wait for the page to load:
+   Output: `OK surface:<ID> workspace:<ID>` — parse the surface ref from this.
+2. Wait for the page to load:
    ```bash
    cmux browser surface:<ID> wait --load-state complete --timeout-ms 15000
    ```
@@ -68,22 +65,18 @@ To open a browser pane alongside your terminal:
 
 To run another Claude Code instance in a new split pane:
 
-1. Create a split:
+1. Create a split (returns the new surface ID):
    ```bash
    cmux new-split right
    ```
-2. Discover the new surface ID:
+   Output: `OK surface:<ID> workspace:<ID>` — parse the surface ref (e.g. `surface:27`).
+2. Send the claude command to the new surface:
    ```bash
-   cmux list-surfaces --json
-   ```
-   The new surface is the one that is NOT your `$CMUX_SURFACE_ID`.
-3. Send the claude command to the new surface:
-   ```bash
-   cmux send-surface --surface <new-surface-id> "claude \"<task description>\"\n"
+   cmux send --surface <new-surface-id> "claude \"<task description>\"\n"
    ```
    For autonomous operation, add `--dangerously-skip-permissions`:
    ```bash
-   cmux send-surface --surface <new-surface-id> "claude --dangerously-skip-permissions \"<task>\"\n"
+   cmux send --surface <new-surface-id> "claude --dangerously-skip-permissions \"<task>\"\n"
    ```
 4. Track progress via sidebar:
    ```bash
@@ -112,7 +105,7 @@ For isolated parallel work combining git worktrees with cmux tiles:
    cmux send "cd /tmp/worktree-<name> && claude \"<task>\"\n"
    ```
 
-Note: You also have the `EnterWorktree` tool for working in a worktree in YOUR session. Use cmux splits + `send-surface` when you want a SEPARATE agent running in parallel.
+Note: You also have the `EnterWorktree` tool for working in a worktree in YOUR session. Use cmux splits + `send --surface` when you want a SEPARATE agent running in parallel.
 
 ### Create a Workspace
 
@@ -129,24 +122,22 @@ cmux new-split right    # horizontal split
 cmux new-split down     # vertical split
 ```
 
-After splitting, always run `cmux list-surfaces --json` to capture the new surface ID.
+`new-split` returns `OK surface:<id> workspace:<id>` — parse the surface ref from the output.
 
 ### Send Commands to Other Surfaces
 
 ```bash
-cmux send-surface --surface <id> "command here\n"
-cmux send-key-surface --surface <id> enter
+cmux send --surface <id> "command here\n"
+cmux send-key --surface <id> enter
 ```
 
 ### Open a New Tab in Current Pane
 
 ```bash
-cmux list-surfaces --json   # note current surfaces
-# Cmd+T creates a new surface tab, or use the API:
-cmux send-key tab           # if needed
+cmux new-surface                        # new terminal tab in current pane
+cmux new-surface --type browser --url https://example.com  # new browser tab
+cmux list-pane-surfaces                 # list all surfaces in current pane
 ```
-
-To send a command to a specific surface tab, always target by surface ID.
 
 ### Notify the User
 
@@ -249,11 +240,14 @@ Best for performance profiling, network inspection, and memory analysis. If Chro
 | New workspace | `cmux new-workspace` |
 | Switch workspace | `cmux select-workspace --workspace <id>` |
 | Close workspace | `cmux close-workspace --workspace <id>` |
-| Split right / down | `cmux new-split right` / `down` |
-| List surfaces | `cmux list-surfaces --json` |
-| Focus surface | `cmux focus-surface --surface <id>` |
-| Send to surface | `cmux send-surface --surface <id> "cmd\n"` |
-| Send key to surface | `cmux send-key-surface --surface <id> enter` |
+| Split right / down | `cmux new-split right` / `down` (returns `OK surface:<id>`) |
+| List pane surfaces | `cmux list-pane-surfaces` |
+| Focus pane | `cmux focus-pane --pane <id>` |
+| Send to surface | `cmux send --surface <id> "cmd\n"` |
+| Send key to surface | `cmux send-key --surface <id> enter` |
+| New surface/tab | `cmux new-surface [--type browser] [--url <url>]` |
+| Close surface | `cmux close-surface --surface <id>` |
+| Read screen | `cmux read-screen --surface <id>` |
 | Open browser | `cmux browser open <URL>` |
 | Open browser split | `cmux browser open-split <URL>` |
 | Browser snapshot | `cmux browser surface:<id> snapshot --interactive --compact` |

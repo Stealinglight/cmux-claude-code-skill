@@ -106,22 +106,49 @@ cmux new-split down
 
 Socket: `{"id":"split-new","method":"surface.split","params":{"direction":"right"}}`
 
-### list-surfaces
+### list-pane-surfaces
 
 ```bash
-cmux list-surfaces
-cmux list-surfaces --json
+cmux list-pane-surfaces
+cmux list-pane-surfaces --json
 ```
 
-Socket: `{"id":"surface-list","method":"surface.list","params":{}}`
-
-### focus-surface
+### list-panes
 
 ```bash
-cmux focus-surface --surface <id>
+cmux list-panes
+cmux list-panes --json
 ```
 
-Socket: `{"id":"surface-focus","method":"surface.focus","params":{"surface_id":"<id>"}}`
+### focus-pane
+
+```bash
+cmux focus-pane --pane <id>
+```
+
+### new-surface
+
+Create a new surface tab in the current pane.
+
+```bash
+cmux new-surface
+cmux new-surface --type browser --url https://example.com
+```
+
+### close-surface
+
+```bash
+cmux close-surface --surface <id>
+```
+
+### read-screen
+
+Read terminal content from a surface.
+
+```bash
+cmux read-screen --surface <id>
+cmux read-screen --surface <id> --scrollback --lines 50
+```
 
 ---
 
@@ -148,23 +175,19 @@ cmux send-key enter
 
 Socket: `{"id":"send-key","method":"surface.send_key","params":{"key":"enter"}}`
 
-### send-surface
+### send (to specific surface)
 
-Send text to a specific surface.
-
-```bash
-cmux send-surface --surface <id> "command"
-```
-
-Socket: `{"id":"send-surface","method":"surface.send_text","params":{"surface_id":"<id>","text":"command"}}`
-
-### send-key-surface
+Send text to a specific surface by adding `--surface`.
 
 ```bash
-cmux send-key-surface --surface <id> enter
+cmux send --surface <id> "command\n"
 ```
 
-Socket: `{"id":"send-key-surface","method":"surface.send_key","params":{"surface_id":"<id>","key":"enter"}}`
+### send-key (to specific surface)
+
+```bash
+cmux send-key --surface <id> enter
+```
 
 ---
 

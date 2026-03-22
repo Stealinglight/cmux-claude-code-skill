@@ -11,25 +11,21 @@ Detailed protocol for launching a Claude Code instance in a new pane.
 ### Step-by-step
 
 ```bash
-# 1. Record your own surface ID
-MY_SURFACE="$CMUX_SURFACE_ID"
+# 1. Create a split pane (returns the new surface ID directly)
+SPLIT_OUTPUT=$(cmux new-split right)
+# Output: "OK surface:27 workspace:10"
+NEW_SURFACE=$(echo "$SPLIT_OUTPUT" | awk '{print $2}')
 
-# 2. Create a split pane
-cmux new-split right
+# 2. Send claude to the new surface
+cmux send --surface "$NEW_SURFACE" "claude \"Implement the login form component\"\n"
 
-# 3. Discover the new surface ID
-NEW_SURFACE=$(cmux list-surfaces --json | jq -r ".surfaces[] | select(.id != \"$MY_SURFACE\") | .id" | head -1)
-
-# 4. Send claude to the new surface
-cmux send-surface --surface "$NEW_SURFACE" "claude \"Implement the login form component\"\n"
-
-# 5. Track via sidebar
+# 3. Track via sidebar
 cmux set-status agent-1 "running" --icon brain --color "#007aff"
 ```
 
 ### Notes
 
-- Always parse `list-surfaces --json` to find new surface IDs. Do not hardcode `surface:2`.
+- `cmux new-split` returns `OK surface:<id> workspace:<id>` — parse the surface ref directly. No need for a follow-up list command.
 - Use `--dangerously-skip-permissions` only when the user has explicitly approved autonomous operation.
 - The spawned agent runs independently. It has its own context and cannot share memory with you.
 
@@ -42,19 +38,13 @@ Spawn N agents across splits or workspaces, monitor via sidebar, collect results
 ### Pattern: Parallel splits in one workspace
 
 ```bash
-# Create 2 right splits for 3 total panes
-cmux new-split right
-cmux new-split right
+# Create 2 right splits — each returns the new surface ID
+SPLIT_A=$(cmux new-split right | awk '{print $2}')
+SPLIT_B=$(cmux new-split right | awk '{print $2}')
 
-# Get all surface IDs
-SURFACES=$(cmux list-surfaces --json)
-
-# Parse and assign tasks
-SURFACE_A=$(echo "$SURFACES" | jq -r '.surfaces[1].id')
-SURFACE_B=$(echo "$SURFACES" | jq -r '.surfaces[2].id')
-
-cmux send-surface --surface "$SURFACE_A" "claude \"Write unit tests for auth module\"\n"
-cmux send-surface --surface "$SURFACE_B" "claude \"Write unit tests for payment module\"\n"
+# Send tasks to each surface
+cmux send --surface "$SPLIT_A" "claude \"Write unit tests for auth module\"\n"
+cmux send --surface "$SPLIT_B" "claude \"Write unit tests for payment module\"\n"
 
 # Track all agents
 cmux set-status agent-auth "testing" --icon flask --color "#ff9500"
@@ -141,7 +131,7 @@ Spawned agents run independently. Coordinate via:
 
 ```bash
 # Agent writes result to a known path
-cmux send-surface --surface "$AGENT_SURFACE" "claude \"Run tests and write results to /tmp/test-results.json\"\n"
+cmux send --surface "$AGENT_SURFACE" "claude \"Run tests and write results to /tmp/test-results.json\"\n"
 
 # Later, read the results
 cat /tmp/test-results.json
@@ -265,9 +255,8 @@ Spawn a reviewer agent alongside your work:
 
 ```bash
 # Split and launch reviewer
-cmux new-split right
-REVIEWER=$(cmux list-surfaces --json | jq -r ".surfaces[] | select(.id != \"$CMUX_SURFACE_ID\") | .id" | head -1)
-cmux send-surface --surface "$REVIEWER" "claude \"Review the changes in the current branch. Run git diff main and provide feedback on code quality, bugs, and security issues. Write your review to /tmp/code-review.md\"\n"
+REVIEWER=$(cmux new-split right | awk '{print $2}')
+cmux send --surface "$REVIEWER" "claude \"Review the changes in the current branch. Run git diff main and provide feedback on code quality, bugs, and security issues. Write your review to /tmp/code-review.md\"\n"
 
 # Continue working while review happens
 cmux set-status reviewer "reviewing" --icon eye --color "#ff9500"
