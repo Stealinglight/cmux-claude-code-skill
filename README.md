@@ -37,17 +37,17 @@ It turns cmux from "a nice terminal" into an integrated development environment 
 
 ## Quick Install
 
-```
+```bash
+# Add the marketplace
 /plugin marketplace add Stealinglight/cmux-claude-code-skill
+
+# Install the plugin
 /plugin install cmux-claude-code-skill@Stealinglight-cmux-claude-code-skill
 ```
 
-Or clone and install locally:
-
+Updates pull automatically when the marketplace syncs. To update manually:
 ```bash
-git clone https://github.com/Stealinglight/cmux-claude-code-skill.git
-# Then in Claude Code:
-/plugin marketplace add /path/to/cmux-claude-code-skill
+/plugin marketplace update Stealinglight-cmux-claude-code-skill
 ```
 
 ## What Claude Learns
@@ -124,16 +124,21 @@ def rpc(method, params=None, req_id=1):
 rpc("notification.create", {"title": "Done", "body": "From Python!"})
 ```
 
-## Skill Contents
+## Plugin Contents
 
 ```
-skills/cmux/
-├── SKILL.md                          # Core skill — action protocols, env detection, browser, agents
-└── references/
-    ├── api-reference.md              # Complete CLI + socket API (every command)
-    ├── browser-automation.md         # Full browser automation reference
-    ├── agent-patterns.md             # Agent spawning, worktree patterns, multi-agent orchestration
-    └── keyboard-shortcuts.md         # All keyboard shortcuts by category
+plugins/cmux/
+├── .claude-plugin/plugin.json        # Plugin manifest
+├── skills/cmux/
+│   ├── SKILL.md                      # Core skill — action protocols, env detection, browser, agents
+│   └── references/
+│       ├── api-reference.md          # Complete CLI + socket API (every command)
+│       ├── browser-automation.md     # Full browser automation reference
+│       ├── agent-patterns.md         # Agent spawning, worktree patterns, agent teams, orchestration
+│       └── keyboard-shortcuts.md     # All keyboard shortcuts by category
+└── bin/
+    ├── tmux                          # tmux-to-cmux shim for Agent Teams split-pane mode
+    └── cmux-agent-teams-setup        # Environment setup script for Agent Teams
 ```
 
 | File | Coverage |
