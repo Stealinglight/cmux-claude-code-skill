@@ -1,6 +1,6 @@
 ---
 name: cmux
-description: "You are running inside cmux, a native macOS terminal built on Ghostty. Use this skill to control cmux via the Bash tool: open browser tiles, split panes, spawn Claude Code agents in new surfaces, manage workspaces, automate the embedded Chromium browser, send notifications, and update sidebar metadata. Triggers on: cmux, cmux browser, cmux notify, cmux API, open browser in cmux, browser tile, split pane, spawn agent, cmux workspace, terminal automation, browser debugging in cmux, cmux sidebar, cmux status, worktree tile, new tab, new tile."
+description: "You are running inside cmux, a native macOS terminal built on Ghostty. Use this skill to control cmux via the Bash tool: open browser tiles, split panes, spawn Claude Code agents in new surfaces, manage workspaces, automate the embedded WebKit browser, send notifications, and update sidebar metadata. Triggers on: cmux, cmux browser, cmux notify, cmux API, open browser in cmux, browser tile, split pane, spawn agent, cmux workspace, terminal automation, browser debugging in cmux, cmux sidebar, cmux status, worktree tile, new tab, new tile."
 user-invocable: false
 ---
 
@@ -8,7 +8,7 @@ user-invocable: false
 
 You are running inside cmux, a native macOS terminal built on Ghostty for AI coding agents. You have full programmatic control of this terminal through the Bash tool.
 
-Docs: https://cmux.dev/docs
+Docs: https://cmux.com/docs (note: cmux.dev redirects to cmux.com)
 
 ## First: Confirm Your Environment
 
@@ -47,7 +47,7 @@ To open a browser pane alongside your terminal:
    ```bash
    cmux browser open-split http://localhost:3000
    ```
-   Output: `OK surface:<ID> workspace:<ID>` — parse the surface ref from this.
+   Output: `OK surface=surface:<ID> pane=pane:<ID> placement=split` — parse the surface ref from this.
 2. Wait for the page to load:
    ```bash
    cmux browser surface:<ID> wait --load-state complete --timeout-ms 15000
@@ -173,17 +173,14 @@ cmux clear-log
 
 ## Browser Automation
 
-The cmux embedded browser is full Chromium. You have three ways to interact with it:
-
-### Option A: cmux browser CLI (via Bash tool)
-
-Best for quick inspections, screenshots, simple interactions.
+The cmux embedded browser is WebKit-based (WKWebView). Control it entirely via the `cmux browser` CLI through the Bash tool.
 
 ```bash
 # Navigation
 cmux browser open https://example.com               # new browser surface
 cmux browser open-split https://localhost:3000       # browser in split pane
-cmux browser surface:<ID> navigate https://example.com --snapshot-after
+cmux browser surface:<ID> navigate 'https://example.com' --snapshot-after
+# ^ IMPORTANT: Quote the URL when using flags like --snapshot-after
 cmux browser surface:<ID> back
 cmux browser surface:<ID> forward
 cmux browser surface:<ID> reload
@@ -209,24 +206,23 @@ cmux browser surface:<ID> type "#search" "query"
 cmux browser surface:<ID> select "#region" "us-east"
 cmux browser surface:<ID> press Enter
 
-# JavaScript
+# JavaScript & CSS injection
 cmux browser surface:<ID> eval "document.title"
+cmux browser surface:<ID> eval "JSON.stringify({url: location.href, cookies: document.cookie.length})"
 cmux browser surface:<ID> addstyle "#debug { display: none !important; }"
+
+# Cookies & storage
+cmux browser surface:<ID> cookies get
+cmux browser surface:<ID> cookies set session_id abc123 --domain example.com
+cmux browser surface:<ID> storage local get theme
+cmux browser surface:<ID> storage local set theme dark
+
+# Session persistence
+cmux browser surface:<ID> state save /tmp/browser-state.json
+cmux browser surface:<ID> state load /tmp/browser-state.json
 ```
 
 For the complete browser command reference, see `references/browser-automation.md`.
-
-### Option B: Playwright MCP
-
-Best for complex multi-step browser automation, form flows, and testing. If Playwright MCP tools are available (check your available tools for `mcp__playwright__*`), they can drive the same Chromium instance that cmux opened.
-
-1. Open a browser surface with cmux: `cmux browser open-split <URL>`
-2. Use Playwright MCP tools (`browser_navigate`, `browser_snapshot`, `browser_click`, etc.) for complex automation
-3. Use cmux browser CLI for quick checks alongside Playwright
-
-### Option C: Chrome DevTools MCP
-
-Best for performance profiling, network inspection, and memory analysis. If Chrome DevTools MCP tools are available (`mcp__chrome-devtools__*`), use them for DevTools-level debugging on the cmux browser.
 
 ---
 

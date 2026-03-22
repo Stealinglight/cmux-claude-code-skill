@@ -1,6 +1,6 @@
 # cmux Claude Code Skill
 
-> Give Claude Code native control of [cmux](https://cmux.dev) — open browser tiles, spawn agents in splits, manage workspaces, automate the embedded Chromium browser, and coordinate worktree-based parallel development.
+> Give Claude Code native control of [cmux](https://cmux.dev) — open browser tiles, spawn agents in splits, manage workspaces, automate the embedded WebKit browser, and coordinate worktree-based parallel development.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Claude Code](https://img.shields.io/badge/Claude_Code-Plugin-blueviolet)](https://docs.anthropic.com/en/docs/claude-code)
@@ -20,7 +20,7 @@ When you run Claude Code inside [cmux](https://cmux.dev), Claude has no idea it'
 - Send you a notification when a long task finishes
 - Show build progress in the sidebar without cluttering your terminal
 - Automate browser interactions — click, fill, screenshot, inspect — all from the CLI
-- Use Playwright MCP or Chrome DevTools MCP to drive the embedded Chromium browser
+- Inspect console output, cookies, localStorage, and inject JavaScript — all from the CLI
 
 It turns cmux from "a nice terminal" into an integrated development environment that Claude actually knows how to use.
 
@@ -70,7 +70,7 @@ cmux browser surface:2 click "button[type='submit']" --snapshot-after
 cmux browser surface:2 screenshot --out /tmp/debug.png
 ```
 
-The embedded browser is full Chromium — Claude can also use **Playwright MCP** or **Chrome DevTools MCP** for advanced automation.
+The embedded browser is WebKit-based (WKWebView) with a full automation CLI — console, cookies, JS eval, DOM inspection, and more.
 
 ### Spawn Agents in New Tiles
 
@@ -78,9 +78,8 @@ Claude can create split panes and launch other Claude Code instances for paralle
 
 ```bash
 # Create a split and send a new Claude agent to it
-cmux new-split right
-NEW_SURFACE=$(cmux list-surfaces --json | jq -r '.surfaces[-1].id')
-cmux send-surface --surface "$NEW_SURFACE" "claude \"Run all tests and fix failures\"\n"
+NEW_SURFACE=$(cmux new-split right | awk '{print $2}')
+cmux send --surface "$NEW_SURFACE" "claude \"Run all tests and fix failures\"\n"
 ```
 
 ### Worktree + Agent Tiles
@@ -139,7 +138,7 @@ skills/cmux/
 
 | File | Coverage |
 |---|---|
-| **SKILL.md** | Environment detection, Bash tool directives, action protocols (browser tiles, agent spawning, worktrees, workspaces, splits, notifications, sidebar), browser MCP integration, quick reference |
+| **SKILL.md** | Environment detection, Bash tool directives, action protocols (browser tiles, agent spawning, worktrees, workspaces, splits, notifications, sidebar), WebKit browser automation, quick reference |
 | **api-reference.md** | Socket connection, workspace/surface/input/notification/sidebar commands, environment variables, configuration, Python + shell examples |
 | **browser-automation.md** | Navigation, waiting, DOM interaction, inspection, JS eval, cookies/storage, tabs, console, dialogs, frames, downloads, common patterns |
 | **agent-patterns.md** | Single/multi-agent spawning, worktree lifecycle, agent communication, Claude Code hooks, safety considerations, parallel development examples |
