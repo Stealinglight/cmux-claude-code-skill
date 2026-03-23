@@ -110,6 +110,20 @@ class CmuxManager:
         refs = re.findall(r"workspace:\d+", output)
         return refs[-1] if refs else ""
 
+    def create_workspace_with_command(self, command: str) -> str:
+        """Create workspace running a specific command. Returns workspace ref."""
+        # Capture refs before
+        before = set(re.findall(r"workspace:\d+", self._run(["list-workspaces"])))
+        self._run(["new-workspace", "--command", command])
+        # Capture refs after — the new one is the diff
+        after = set(re.findall(r"workspace:\d+", self._run(["list-workspaces"])))
+        new_refs = after - before
+        if new_refs:
+            return new_refs.pop()
+        # Fallback: return the highest numbered ref
+        all_refs = sorted(after, key=lambda r: int(r.split(":")[1]))
+        return all_refs[-1] if all_refs else ""
+
     def select_workspace(self, ws_id: str):
         self._run(["select-workspace", "--workspace", ws_id])
 
@@ -393,8 +407,9 @@ class TmuxBridge:
                 elif len(parts) == 1:
                     self.state.windows[parts[0]] = "shell"
 
+        # Use -s (session panes only) instead of -a (all sessions)
         panes_response = await self._send_tmux_command(
-            "list-panes -a -F '#{pane_id} #{window_id} #{pane_title}'"
+            "list-panes -s -F '#{pane_id} #{window_id} #{window_name}'"
         )
         if panes_response:
             for line in panes_response:
@@ -402,7 +417,8 @@ class TmuxBridge:
                 if len(parts) >= 2:
                     pane_id = parts[0]
                     window_id = parts[1]
-                    window_name = self.state.windows.get(window_id, "shell")
+                    window_name = parts[2] if len(parts) > 2 else self.state.windows.get(window_id, "shell")
+                    self.state.windows[window_id] = window_name
                     await self._setup_pane(pane_id, window_id, window_name)
 
         log("Bootstrap complete: " + str(len(self.state.panes)) + " panes")
@@ -421,30 +437,23 @@ class TmuxBridge:
         srv_sock.listen(1)
         srv_sock.setblocking(False)
 
-        ws_id = self.cmux.create_workspace()
+        # Create workspace with relay command — this launches the relay directly
+        # in the new workspace's terminal, avoiding surface ID lookup issues
+        relay_cmd = (
+            self.relay_path + " " + socket_path
+            + " --pane-id " + pane_id
+            + " --bridge-pid " + str(os.getpid())
+        )
+        ws_id = self.cmux.create_workspace_with_command(relay_cmd)
         if ws_id:
-            self.cmux.select_workspace(ws_id)
-            surface_id = self.cmux.get_current_surface()
-
             ws_name = self.state.prefix + window_name
             self.cmux.rename_workspace(ws_id, ws_name)
-
-            # Wait for shell to initialize in the new workspace surface
-            await asyncio.sleep(1.5)
-
-            # Launch relay — use \\n so cmux send interprets it as Enter
-            relay_cmd = (
-                self.relay_path + " " + socket_path
-                + " --pane-id " + pane_id
-                + " --bridge-pid " + str(os.getpid()) + "\\n"
-            )
-            self.cmux.send_to_surface(surface_id, relay_cmd)
 
             self.state.panes[pane_id] = PaneState(
                 tmux_pane_id=pane_id,
                 tmux_window_id=window_id,
                 cmux_workspace_id=ws_id,
-                cmux_surface_id=surface_id,
+                cmux_surface_id="",  # Not needed with --command approach
                 socket_path=socket_path,
                 server_socket=srv_sock,
                 window_name=window_name,
@@ -602,20 +611,21 @@ class TmuxBridge:
             pane.active = False
 
     async def on_window_add(self, window_id):
+        log("Window added: " + window_id)
+        # Brief delay — tmux may not have the window fully ready
+        await asyncio.sleep(0.3)
+
         response = await self._send_tmux_command(
-            "list-panes -t " + window_id + " -F '#{pane_id} #{window_id} #{pane_title}'"
+            "list-panes -t " + window_id + " -F '#{pane_id} #{window_id} #{window_name}'"
         )
         if response:
-            name_resp = await self._send_tmux_command(
-                "display-message -t " + window_id + " -p '#{window_name}'"
-            )
-            window_name = name_resp[0].strip("'") if name_resp else "shell"
-            self.state.windows[window_id] = window_name
-
             for line in response:
                 parts = line.strip("'").split(None, 2)
                 if len(parts) >= 2:
-                    await self._setup_pane(parts[0], window_id, window_name)
+                    pane_id = parts[0]
+                    window_name = parts[2] if len(parts) > 2 else "shell"
+                    self.state.windows[window_id] = window_name
+                    await self._setup_pane(pane_id, window_id, window_name)
 
         pane_count = len([p for p in self.state.panes.values() if p.active])
         self.cmux.set_status(
