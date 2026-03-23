@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""cmux-tmux-relay: Bidirectional I/O relay between a cmux surface and cmux-tmux-bridge.
+
+This process runs inside a cmux surface (workspace). It connects to the bridge
+daemon via a Unix domain socket and relays terminal I/O:
+  - Data from the bridge socket → written to terminal (shows tmux pane output)
+  - Data from terminal stdin   → sent to bridge socket (user input to tmux)
+
+The bridge daemon launches this automatically. Users should not run it directly.
+
+Usage: cmux-tmux-relay <socket-path> [--pane-id ID] [--bridge-pid PID] [--debug]
+"""
+
+import argparse
+import os
+import select
+import signal
+import socket
+import sys
+import termios
+import tty
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Per-pane relay for cmux-tmux-bridge"
+    )
+    parser.add_argument("socket_path", help="Path to the Unix domain socket for this pane")
+    parser.add_argument("--pane-id", default="unknown", help="tmux pane ID (for display)")
+    parser.add_argument("--bridge-pid", type=int, default=0, help="PID of the bridge process")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging to stderr")
+    return parser.parse_args()
+
+
+def debug_log(msg, enabled=False):
+    if enabled:
+        sys.stderr.write(f"[relay] {msg}\n")
+        sys.stderr.flush()
+
+
+def write_resize(socket_dir, pane_id, bridge_pid):
+    """Write current terminal size to a resize file and signal the bridge."""
+    try:
+        rows, cols = os.get_terminal_size()
+        resize_path = os.path.join(
+            os.path.dirname(socket_dir) if "/" in socket_dir else "/tmp",
+            f"resize-{pane_id.lstrip('%')}"
+        )
+        # Find the socket dir from the socket path
+        resize_dir = os.path.dirname(socket_dir)
+        resize_path = os.path.join(resize_dir, f"resize-{pane_id.lstrip('%')}")
+        with open(resize_path, "w") as f:
+            f.write(f"{rows}x{cols}\n")
+        if bridge_pid > 0:
+            os.kill(bridge_pid, signal.SIGUSR1)
+    except (OSError, ValueError):
+        pass
+
+
+def main():
+    args = parse_args()
+    debug = args.debug
+
+    debug_log(f"Starting relay for pane {args.pane_id}", debug)
+    debug_log(f"Connecting to {args.socket_path}", debug)
+
+    # Connect to bridge socket
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(args.socket_path)
+    except (ConnectionRefusedError, FileNotFoundError) as e:
+        print(f"[relay] Failed to connect to bridge: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    debug_log("Connected to bridge", debug)
+
+    # Save terminal state
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+    old_settings = termios.tcgetattr(stdin_fd)
+
+    # Handle SIGWINCH (terminal resize)
+    def on_winch(signum, frame):
+        write_resize(args.socket_path, args.pane_id, args.bridge_pid)
+
+    signal.signal(signal.SIGWINCH, on_winch)
+
+    # Handle SIGTERM gracefully
+    running = True
+
+    def on_term(signum, frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, on_term)
+
+    try:
+        # Enter raw mode — no echo, no line buffering, no signal processing
+        tty.setraw(stdin_fd)
+
+        # Send initial resize
+        write_resize(args.socket_path, args.pane_id, args.bridge_pid)
+
+        # Main relay loop
+        sock.setblocking(False)
+
+        while running:
+            try:
+                readable, _, _ = select.select([stdin_fd, sock], [], [], 1.0)
+            except (select.error, InterruptedError):
+                continue
+
+            for source in readable:
+                if source == stdin_fd:
+                    # User typed something → send to bridge → tmux
+                    try:
+                        data = os.read(stdin_fd, 4096)
+                    except OSError:
+                        running = False
+                        break
+                    if not data:
+                        running = False
+                        break
+                    try:
+                        sock.sendall(data)
+                    except (BrokenPipeError, ConnectionResetError):
+                        running = False
+                        break
+
+                elif source == sock:
+                    # Bridge sent tmux pane output → write to terminal
+                    try:
+                        data = sock.recv(65536)
+                    except (BlockingIOError, InterruptedError):
+                        continue
+                    except (ConnectionResetError, OSError):
+                        running = False
+                        break
+                    if not data:
+                        running = False
+                        break
+                    try:
+                        os.write(stdout_fd, data)
+                    except OSError:
+                        running = False
+                        break
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Restore terminal
+        try:
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_settings)
+        except (termios.error, OSError):
+            pass
+        sock.close()
+        debug_log("Relay exited", debug)
+
+
+if __name__ == "__main__":
+    main()

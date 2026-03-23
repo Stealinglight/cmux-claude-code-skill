@@ -1,0 +1,820 @@
+#!/usr/bin/env python3
+"""cmux-tmux-bridge: Attach to a tmux session and create native cmux workspaces.
+
+Connects to a running tmux session via control mode (tmux -CC), parses the
+structured protocol, and creates cmux workspaces for each tmux pane. Each
+workspace runs a relay process that pipes I/O between the cmux terminal and
+the tmux pane.
+
+Usage: cmux-tmux-bridge <session> [--prefix PREFIX] [--no-cleanup] [--debug]
+"""
+
+import argparse
+import asyncio
+import fcntl
+import json
+import os
+import pty
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# ── Octal escape decoder ───────────────────────────────────────────────────
+
+_OCTAL_RE = re.compile(rb"\\([0-7]{3})")
+
+
+def decode_tmux_output(data: bytes) -> bytes:
+    """Decode tmux %output octal-escaped data."""
+    return _OCTAL_RE.sub(lambda m: bytes([int(m.group(1), 8)]), data)
+
+
+# ── Layout string parser ───────────────────────────────────────────────────
+
+def extract_pane_ids_from_layout(layout: str) -> set:
+    """Extract pane IDs (integers) from a tmux layout string."""
+    pane_ids = set()
+    for match in re.finditer(r",(\d+)(?=[}\]\s,]|$)", layout):
+        pane_ids.add(int(match.group(1)))
+    return pane_ids
+
+
+# ── Data classes ────────────────────────────────────────────────────────────
+
+@dataclass
+class PaneState:
+    tmux_pane_id: str
+    tmux_window_id: str
+    cmux_workspace_id: str = ""
+    cmux_surface_id: str = ""
+    socket_path: str = ""
+    server_socket: object = None
+    client_conn: object = None
+    window_name: str = ""
+    active: bool = False
+
+
+@dataclass
+class BridgeState:
+    tmux_session: str
+    socket_dir: str
+    prefix: str
+    panes: dict = field(default_factory=dict)
+    windows: dict = field(default_factory=dict)
+    original_workspace: str = ""
+    tmux_process: object = None
+    # FIFO queue for command responses — tmux assigns its own cmd numbers
+    pending_responses: list = field(default_factory=list)  # list of asyncio.Future
+
+
+# ── cmux Manager ────────────────────────────────────────────────────────────
+
+class CmuxManager:
+    """Interact with cmux via CLI."""
+
+    def __init__(self, debug=False):
+        self._debug = debug
+
+    def _run(self, args, capture=True):
+        cmd = ["cmux"] + args
+        if self._debug:
+            log("cmux: " + " ".join(cmd))
+        result = subprocess.run(cmd, capture_output=capture, text=True, timeout=10)
+        return result.stdout.strip() if capture else ""
+
+    def ping(self) -> bool:
+        try:
+            return "PONG" in self._run(["ping"])
+        except Exception:
+            return False
+
+    def current_workspace(self) -> str:
+        try:
+            output = self._run(["identify", "--json"])
+            data = json.loads(output)
+            return data.get("caller", {}).get("workspace_ref", "")
+        except Exception:
+            return ""
+
+    def create_workspace(self) -> str:
+        self._run(["new-workspace"])
+        output = self._run(["list-workspaces"])
+        refs = re.findall(r"workspace:\d+", output)
+        return refs[-1] if refs else ""
+
+    def select_workspace(self, ws_id: str):
+        self._run(["select-workspace", "--workspace", ws_id])
+
+    def close_workspace(self, ws_id: str):
+        try:
+            self._run(["close-workspace", "--workspace", ws_id])
+        except Exception:
+            pass
+
+    def rename_workspace(self, ws_id: str, name: str):
+        try:
+            self._run(["rename-workspace", "--workspace", ws_id, name])
+        except Exception:
+            pass
+
+    def get_current_surface(self) -> str:
+        try:
+            output = self._run(["identify", "--json"])
+            data = json.loads(output)
+            return data.get("focused", {}).get("surface_ref", "")
+        except Exception:
+            return ""
+
+    def send_to_surface(self, surface_id: str, text: str):
+        self._run(["send", "--surface", surface_id, text])
+
+    def set_status(self, key: str, value: str, icon: str = "", color: str = ""):
+        args = ["set-status", key, value]
+        if icon:
+            args += ["--icon", icon]
+        if color:
+            args += ["--color", color]
+        self._run(args)
+
+    def clear_status(self, key: str):
+        try:
+            self._run(["clear-status", key])
+        except Exception:
+            pass
+
+    def notify(self, title: str, body: str):
+        self._run(["notify", "--title", title, "--body", body])
+
+
+# ── Logging ─────────────────────────────────────────────────────────────────
+
+_DEBUG = False
+
+
+def log(msg: str):
+    if _DEBUG:
+        sys.stderr.write("[bridge] " + msg + "\n")
+        sys.stderr.flush()
+
+
+def info(msg: str):
+    sys.stderr.write("[cmux-tmux-bridge] " + msg + "\n")
+    sys.stderr.flush()
+
+
+# ── tmux Control Mode Parser ───────────────────────────────────────────────
+
+class TmuxControlParser:
+    """Parse tmux control mode output stream."""
+
+    def __init__(self, bridge):
+        self.bridge = bridge
+        self.in_block = False
+        self.block_cmd_num = None
+        self.block_lines = []
+
+    async def parse_line(self, line: str):
+        line = line.rstrip("\n\r")
+
+        if line.startswith("\033P") or line.startswith("\x1bP"):
+            log("DCS sequence (discarded)")
+            return
+
+        if self.in_block:
+            if line.startswith("%end ") or line.startswith("%error "):
+                is_error = line.startswith("%error")
+                log("Block " + ("error" if is_error else "end") +
+                    ": " + str(len(self.block_lines)) + " lines")
+
+                # Resolve the oldest pending response (FIFO order)
+                if self.bridge.state.pending_responses:
+                    future = self.bridge.state.pending_responses.pop(0)
+                    if not future.done():
+                        future.set_result(None if is_error else self.block_lines[:])
+
+                self.in_block = False
+                self.block_lines = []
+                return
+
+            self.block_lines.append(line)
+            return
+
+        if line.startswith("%begin "):
+            parts = line.split()
+            self.block_cmd_num = int(parts[1]) if len(parts) > 1 else 0
+            self.in_block = True
+            self.block_lines = []
+            return
+
+        if line.startswith("%output "):
+            await self._handle_output(line)
+            return
+
+        if line.startswith("%window-add "):
+            window_id = line.split()[1] if len(line.split()) > 1 else ""
+            await self.bridge.on_window_add(window_id)
+            return
+
+        if line.startswith("%window-close "):
+            window_id = line.split()[1] if len(line.split()) > 1 else ""
+            await self.bridge.on_window_close(window_id)
+            return
+
+        if line.startswith("%window-renamed "):
+            parts = line.split(None, 2)
+            window_id = parts[1] if len(parts) > 1 else ""
+            name = parts[2] if len(parts) > 2 else ""
+            await self.bridge.on_window_renamed(window_id, name)
+            return
+
+        if line.startswith("%layout-change "):
+            parts = line.split(None, 2)
+            window_id = parts[1] if len(parts) > 1 else ""
+            layout = parts[2] if len(parts) > 2 else ""
+            await self.bridge.on_layout_change(window_id, layout)
+            return
+
+        if line.startswith("%exit"):
+            reason = line[5:].strip() if len(line) > 5 else "unknown"
+            info("tmux session ended: " + reason)
+            await self.bridge.on_exit(reason)
+            return
+
+        if line.startswith("%"):
+            log("Notification: " + line[:80])
+            return
+
+    async def _handle_output(self, line: str):
+        first_space = line.index(" ")
+        rest = line[first_space + 1:]
+        second_space = rest.index(" ") if " " in rest else len(rest)
+        pane_id = rest[:second_space]
+        raw_data = rest[second_space + 1:] if second_space < len(rest) else ""
+        decoded = decode_tmux_output(raw_data.encode("latin-1"))
+        await self.bridge.on_pane_output(pane_id, decoded)
+
+
+# ── Bridge Daemon ───────────────────────────────────────────────────────────
+
+class TmuxBridge:
+
+    def __init__(self, session, prefix, cleanup, debug, reconnect):
+        self.session = session
+        self.cleanup = cleanup
+        self.reconnect = reconnect
+        self.cmux = CmuxManager(debug=debug)
+        self.parser = TmuxControlParser(self)
+        self.relay_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "cmux-tmux-relay"
+        )
+        self.running = False
+        self.tmux_stdin_lock = asyncio.Lock()
+
+        socket_dir = tempfile.mkdtemp(prefix="cmux-bridge-")
+        os.chmod(socket_dir, 0o700)
+
+        self.state = BridgeState(
+            tmux_session=session,
+            socket_dir=socket_dir,
+            prefix=prefix,
+        )
+
+    async def start(self):
+        if not os.environ.get("CMUX_SURFACE_ID"):
+            info("Error: Not running inside cmux (CMUX_SURFACE_ID not set)")
+            sys.exit(1)
+        if not self.cmux.ping():
+            info("Error: Cannot connect to cmux")
+            sys.exit(1)
+
+        # Verify tmux session exists using the real tmux binary
+        real_tmux = shutil.which("tmux")
+        # Skip our shim if it's first in PATH
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        tmux_paths = []
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            candidate = os.path.join(d, "tmux")
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                if d != script_dir:
+                    tmux_paths.append(candidate)
+        real_tmux = tmux_paths[0] if tmux_paths else "tmux"
+
+        result = subprocess.run(
+            [real_tmux, "has-session", "-t", self.session],
+            capture_output=True
+        )
+        if result.returncode != 0:
+            info("Error: tmux session '" + self.session + "' not found")
+            subprocess.run([real_tmux, "list-sessions"])
+            sys.exit(1)
+
+        self.state.original_workspace = self.cmux.current_workspace()
+        self.cmux.set_status("tmux-bridge", "connecting", icon="link", color="#ff9500")
+
+        info("Attaching to tmux session: " + self.session)
+
+        # tmux -CC sends ALL output through the PTY (not stdout)
+        # So we use the PTY for stdin, stdout, AND stderr
+        master_fd, slave_fd = pty.openpty()
+
+        # Set reasonable PTY size
+        winsize = struct.pack("HHHH", 24, 80, 0, 0)
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+
+        self.state.tmux_process = await asyncio.create_subprocess_exec(
+            real_tmux, "-CC", "attach-session", "-t", self.session,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+        )
+        os.close(slave_fd)  # Bridge owns the master end
+
+        # Store master fd — used for BOTH reading output AND writing commands
+        self._tmux_master_fd = master_fd
+        flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+        fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+        self.running = True
+
+        # Start the parser as a background task FIRST — bootstrap needs it
+        # to receive command responses
+        parser_task = asyncio.create_task(self._main_loop())
+
+        # Give tmux a moment to send initial control mode output
+        await asyncio.sleep(1.0)
+
+        await self._bootstrap()
+
+        pane_count = len(self.state.panes)
+        self.cmux.set_status("tmux-bridge", "connected", icon="link", color="#30d158")
+        self.cmux.set_status(
+            "tmux-session",
+            self.session + " (" + str(pane_count) + " panes)",
+            icon="terminal",
+        )
+        self.cmux.notify(
+            "tmux bridge",
+            "Connected to '" + self.session + "' - " + str(pane_count) + " panes",
+        )
+
+        if self.state.original_workspace:
+            self.cmux.select_workspace(self.state.original_workspace)
+
+        info("Bridge active - " + str(pane_count) + " panes mapped to cmux workspaces")
+        info("Press Ctrl+C to detach")
+
+        try:
+            # Wait for the parser task (runs until tmux exits or bridge stops)
+            await parser_task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await self.shutdown()
+
+    async def _bootstrap(self):
+        log("Bootstrapping from existing session...")
+
+        windows_response = await self._send_tmux_command(
+            "list-windows -F '#{window_id} #{window_name}'"
+        )
+        if windows_response:
+            for line in windows_response:
+                parts = line.strip("'").split(None, 1)
+                if len(parts) >= 2:
+                    self.state.windows[parts[0]] = parts[1]
+                elif len(parts) == 1:
+                    self.state.windows[parts[0]] = "shell"
+
+        panes_response = await self._send_tmux_command(
+            "list-panes -a -F '#{pane_id} #{window_id} #{pane_title}'"
+        )
+        if panes_response:
+            for line in panes_response:
+                parts = line.strip("'").split(None, 2)
+                if len(parts) >= 2:
+                    pane_id = parts[0]
+                    window_id = parts[1]
+                    window_name = self.state.windows.get(window_id, "shell")
+                    await self._setup_pane(pane_id, window_id, window_name)
+
+        log("Bootstrap complete: " + str(len(self.state.panes)) + " panes")
+
+    async def _setup_pane(self, pane_id, window_id, window_name):
+        if pane_id in self.state.panes:
+            return
+
+        log("Setting up pane " + pane_id)
+
+        safe_id = pane_id.lstrip("%")
+        socket_path = os.path.join(self.state.socket_dir, "pane-" + safe_id + ".sock")
+        srv_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv_sock.bind(socket_path)
+        os.chmod(socket_path, 0o600)
+        srv_sock.listen(1)
+        srv_sock.setblocking(False)
+
+        ws_id = self.cmux.create_workspace()
+        if ws_id:
+            self.cmux.select_workspace(ws_id)
+            surface_id = self.cmux.get_current_surface()
+
+            ws_name = self.state.prefix + window_name
+            self.cmux.rename_workspace(ws_id, ws_name)
+
+            # Wait for shell to initialize in the new workspace surface
+            await asyncio.sleep(1.5)
+
+            # Launch relay — use \\n so cmux send interprets it as Enter
+            relay_cmd = (
+                self.relay_path + " " + socket_path
+                + " --pane-id " + pane_id
+                + " --bridge-pid " + str(os.getpid()) + "\\n"
+            )
+            self.cmux.send_to_surface(surface_id, relay_cmd)
+
+            self.state.panes[pane_id] = PaneState(
+                tmux_pane_id=pane_id,
+                tmux_window_id=window_id,
+                cmux_workspace_id=ws_id,
+                cmux_surface_id=surface_id,
+                socket_path=socket_path,
+                server_socket=srv_sock,
+                window_name=window_name,
+                active=True,
+            )
+
+            asyncio.create_task(self._accept_relay(pane_id))
+        else:
+            info("Warning: Failed to create workspace for pane " + pane_id)
+            srv_sock.close()
+            os.unlink(socket_path)
+
+    async def _accept_relay(self, pane_id):
+        pane = self.state.panes.get(pane_id)
+        if not pane or not pane.server_socket:
+            return
+
+        loop = asyncio.get_event_loop()
+        try:
+            conn, _ = await asyncio.wait_for(
+                loop.sock_accept(pane.server_socket), timeout=15.0
+            )
+            conn.setblocking(False)
+            pane.client_conn = conn
+            log("Relay connected for pane " + pane_id)
+            asyncio.create_task(self._read_relay_input(pane_id))
+        except asyncio.TimeoutError:
+            info("Warning: Relay for pane " + pane_id + " did not connect in 15s")
+        except Exception as e:
+            log("Error accepting relay for " + pane_id + ": " + str(e))
+
+    async def _read_relay_input(self, pane_id):
+        pane = self.state.panes.get(pane_id)
+        if not pane or not pane.client_conn:
+            return
+
+        loop = asyncio.get_event_loop()
+
+        while self.running and pane.active:
+            try:
+                data = await loop.sock_recv(pane.client_conn, 4096)
+                if not data:
+                    pane.active = False
+                    break
+
+                # Brief delay to batch rapid keystrokes
+                await asyncio.sleep(0.005)
+
+                # Drain any additional buffered data
+                while True:
+                    try:
+                        more = pane.client_conn.recv(4096)
+                        if more:
+                            data += more
+                        else:
+                            break
+                    except (BlockingIOError, OSError):
+                        break
+
+                await self._send_input_to_tmux(pane_id, data)
+
+            except (ConnectionResetError, BrokenPipeError, OSError):
+                pane.active = False
+                break
+
+    async def _send_input_to_tmux(self, pane_id, data):
+        hex_keys = " ".join("{:02x}".format(b) for b in data)
+        cmd = "send-keys -t " + pane_id + " -H " + hex_keys
+        await self._send_tmux_command_fire_and_forget(cmd)
+
+    async def _send_tmux_command(self, cmd):
+        if not hasattr(self, "_tmux_master_fd"):
+            return None
+
+        future = asyncio.get_event_loop().create_future()
+        self.state.pending_responses.append(future)
+
+        async with self.tmux_stdin_lock:
+            log("Sending: " + cmd[:80])
+            os.write(self._tmux_master_fd, (cmd + "\n").encode())
+
+        try:
+            return await asyncio.wait_for(future, timeout=10.0)
+        except asyncio.TimeoutError:
+            try:
+                self.state.pending_responses.remove(future)
+            except ValueError:
+                pass
+            log("Command timeout: " + cmd)
+            return None
+
+    async def _send_tmux_command_fire_and_forget(self, cmd):
+        if not hasattr(self, "_tmux_master_fd"):
+            return
+        async with self.tmux_stdin_lock:
+            try:
+                os.write(self._tmux_master_fd, (cmd + "\n").encode())
+            except OSError:
+                self.running = False
+
+    async def _main_loop(self):
+        """Read tmux control mode output from master PTY fd."""
+        if not hasattr(self, "_tmux_master_fd"):
+            return
+
+        loop = asyncio.get_event_loop()
+        buf = b""
+
+        while self.running:
+            try:
+                # Wait for data on the master fd
+                await loop.run_in_executor(None, self._wait_for_read)
+
+                try:
+                    data = os.read(self._tmux_master_fd, 65536)
+                except (OSError, BlockingIOError):
+                    continue
+
+                if not data:
+                    info("tmux process ended")
+                    self.running = False
+                    break
+
+                buf += data
+
+                # Process complete lines
+                while b"\n" in buf:
+                    line_bytes, buf = buf.split(b"\n", 1)
+                    line = line_bytes.decode("latin-1").rstrip("\r")
+                    await self.parser.parse_line(line)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log("Parse error: " + str(e))
+
+    def _wait_for_read(self):
+        """Block until master fd is readable (runs in executor thread)."""
+        import select as sel
+        while self.running:
+            r, _, _ = sel.select([self._tmux_master_fd], [], [], 0.5)
+            if r:
+                return
+
+    # ── Event handlers ──────────────────────────────────────────────────
+
+    async def on_pane_output(self, pane_id, data):
+        pane = self.state.panes.get(pane_id)
+        if not pane or not pane.client_conn or not pane.active:
+            return
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.sock_sendall(pane.client_conn, data)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pane.active = False
+
+    async def on_window_add(self, window_id):
+        response = await self._send_tmux_command(
+            "list-panes -t " + window_id + " -F '#{pane_id} #{window_id} #{pane_title}'"
+        )
+        if response:
+            name_resp = await self._send_tmux_command(
+                "display-message -t " + window_id + " -p '#{window_name}'"
+            )
+            window_name = name_resp[0].strip("'") if name_resp else "shell"
+            self.state.windows[window_id] = window_name
+
+            for line in response:
+                parts = line.strip("'").split(None, 2)
+                if len(parts) >= 2:
+                    await self._setup_pane(parts[0], window_id, window_name)
+
+        pane_count = len([p for p in self.state.panes.values() if p.active])
+        self.cmux.set_status(
+            "tmux-session",
+            self.session + " (" + str(pane_count) + " panes)",
+            icon="terminal",
+        )
+
+    async def on_window_close(self, window_id):
+        to_remove = [
+            pid for pid, pane in self.state.panes.items()
+            if pane.tmux_window_id == window_id
+        ]
+        for pane_id in to_remove:
+            await self._teardown_pane(pane_id)
+        self.state.windows.pop(window_id, None)
+
+        pane_count = len([p for p in self.state.panes.values() if p.active])
+        self.cmux.set_status(
+            "tmux-session",
+            self.session + " (" + str(pane_count) + " panes)",
+            icon="terminal",
+        )
+
+    async def on_window_renamed(self, window_id, name):
+        self.state.windows[window_id] = name
+        for pane in self.state.panes.values():
+            if pane.tmux_window_id == window_id and pane.active:
+                self.cmux.rename_workspace(
+                    pane.cmux_workspace_id, self.state.prefix + name
+                )
+
+    async def on_layout_change(self, window_id, layout):
+        current_ids = extract_pane_ids_from_layout(layout)
+        known_ids = {
+            int(p.tmux_pane_id.lstrip("%"))
+            for p in self.state.panes.values()
+            if p.tmux_window_id == window_id
+        }
+        new_ids = current_ids - known_ids
+        if new_ids:
+            window_name = self.state.windows.get(window_id, "shell")
+            for pane_num in new_ids:
+                await self._setup_pane("%" + str(pane_num), window_id, window_name)
+
+    async def on_exit(self, reason):
+        self.running = False
+        self.cmux.notify("tmux bridge", "Session ended: " + reason)
+
+    async def _teardown_pane(self, pane_id):
+        pane = self.state.panes.get(pane_id)
+        if not pane:
+            return
+        pane.active = False
+
+        if pane.client_conn:
+            try:
+                pane.client_conn.close()
+            except OSError:
+                pass
+        if pane.server_socket:
+            try:
+                pane.server_socket.close()
+            except OSError:
+                pass
+        if pane.socket_path and os.path.exists(pane.socket_path):
+            try:
+                os.unlink(pane.socket_path)
+            except OSError:
+                pass
+        if self.cleanup and pane.cmux_workspace_id:
+            self.cmux.close_workspace(pane.cmux_workspace_id)
+
+        self.state.panes.pop(pane_id, None)
+
+    async def shutdown(self):
+        info("Shutting down bridge...")
+        self.running = False
+        self.cmux.set_status("tmux-bridge", "disconnecting", icon="xmark", color="#ff3b30")
+
+        for pane_id in list(self.state.panes.keys()):
+            await self._teardown_pane(pane_id)
+
+        await asyncio.sleep(0.5)
+
+        # Close PTY master
+        if hasattr(self, "_tmux_master_fd"):
+            try:
+                os.close(self._tmux_master_fd)
+            except OSError:
+                pass
+
+        proc = self.state.tmux_process
+        if proc:
+            try:
+                proc.terminate()
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        shutil.rmtree(self.state.socket_dir, ignore_errors=True)
+        self.cmux.clear_status("tmux-bridge")
+        self.cmux.clear_status("tmux-session")
+
+        if self.state.original_workspace:
+            try:
+                self.cmux.select_workspace(self.state.original_workspace)
+            except Exception:
+                pass
+
+        self.cmux.notify("tmux bridge", "Disconnected from '" + self.session + "'")
+        info("Bridge shutdown complete")
+
+
+# ── Resize handler ──────────────────────────────────────────────────────────
+
+def setup_resize_handler(bridge):
+    def on_usr1(signum, frame):
+        for pane_id, pane in bridge.state.panes.items():
+            safe_id = pane_id.lstrip("%")
+            resize_path = os.path.join(bridge.state.socket_dir, "resize-" + safe_id)
+            if os.path.exists(resize_path):
+                try:
+                    with open(resize_path) as f:
+                        size = f.read().strip()
+                    os.unlink(resize_path)
+                    if "x" in size:
+                        rows, cols = size.split("x")
+                        loop = asyncio.get_event_loop()
+                        loop.call_soon_threadsafe(
+                            lambda pid=pane_id, r=rows, c=cols:
+                            asyncio.ensure_future(
+                                bridge._send_tmux_command_fire_and_forget(
+                                    "resize-pane -t " + pid + " -x " + c + " -y " + r
+                                )
+                            )
+                        )
+                except Exception:
+                    pass
+
+    signal.signal(signal.SIGUSR1, on_usr1)
+
+
+# ── CLI ─────────────────────────────────────────────────────────────────────
+
+def parse_cli_args():
+    parser = argparse.ArgumentParser(
+        description="Attach to a tmux session with native cmux workspaces",
+        epilog="Examples:\n"
+               "  cmux-tmux-bridge dev\n"
+               "  cmux-tmux-bridge production --prefix 'prod:'\n"
+               "  cmux-tmux-bridge dev --debug 2>/tmp/bridge.log\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("session", help="tmux session name or ID")
+    parser.add_argument("--prefix", default="tmux:", help="Workspace name prefix")
+    parser.add_argument("--no-cleanup", action="store_true",
+                        help="Don't close cmux workspaces on exit")
+    parser.add_argument("--reconnect", action="store_true",
+                        help="Attempt reconnection on disconnect")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return parser.parse_args()
+
+
+def main():
+    global _DEBUG
+    args = parse_cli_args()
+    _DEBUG = args.debug
+
+    bridge = TmuxBridge(
+        session=args.session,
+        prefix=args.prefix,
+        cleanup=not args.no_cleanup,
+        debug=args.debug,
+        reconnect=args.reconnect,
+    )
+
+    setup_resize_handler(bridge)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    def signal_handler():
+        info("Ctrl+C - detaching...")
+        bridge.running = False
+
+    loop.add_signal_handler(signal.SIGINT, signal_handler)
+    loop.add_signal_handler(signal.SIGTERM, signal_handler)
+
+    try:
+        loop.run_until_complete(bridge.start())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.close()
+
+
+if __name__ == "__main__":
+    main()
