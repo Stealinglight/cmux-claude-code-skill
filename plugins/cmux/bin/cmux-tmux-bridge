@@ -301,6 +301,7 @@ class TmuxBridge:
             os.path.dirname(os.path.abspath(__file__)), "cmux-tmux-relay"
         )
         self.running = False
+        self.bootstrapping = True  # Suppress event handlers during bootstrap
         self.tmux_stdin_lock = asyncio.Lock()
 
         socket_dir = tempfile.mkdtemp(prefix="cmux-bridge-")
@@ -354,13 +355,24 @@ class TmuxBridge:
         winsize = struct.pack("HHHH", 24, 80, 0, 0)
         fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
 
-        self.state.tmux_process = await asyncio.create_subprocess_exec(
-            real_tmux, "-CC", "attach-session", "-t", self.session,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-        )
-        os.close(slave_fd)  # Bridge owns the master end
+        # Fork directly — tmux -CC needs a proper session with controlling
+        # terminal for %output notifications to work correctly.
+        child_pid = os.fork()
+        if child_pid == 0:
+            # Child: set up session and exec tmux
+            os.close(master_fd)
+            os.setsid()
+            os.dup2(slave_fd, 0)
+            os.dup2(slave_fd, 1)
+            os.dup2(slave_fd, 2)
+            if slave_fd > 2:
+                os.close(slave_fd)
+            os.execv(real_tmux, [real_tmux, "-CC", "attach-session", "-t", self.session])
+            os._exit(1)
+
+        # Parent: owns the master fd
+        os.close(slave_fd)
+        self.state.tmux_process = child_pid  # Store PID instead of Popen object
 
         # Store master fd — used for BOTH reading output AND writing commands
         self._tmux_master_fd = master_fd
@@ -376,7 +388,13 @@ class TmuxBridge:
         # Give tmux a moment to send initial control mode output
         await asyncio.sleep(1.0)
 
+        # CRITICAL: Set client size so tmux sends %output notifications.
+        # Control mode clients are "headless" by default — no size = no output.
+        await self._send_tmux_command("refresh-client -C 200,50")
+        await asyncio.sleep(0.3)
+
         await self._bootstrap()
+        self.bootstrapping = False  # Now accept dynamic events
 
         pane_count = len(self.state.panes)
         self.cmux.set_status("tmux-bridge", "connected", icon="link", color="#30d158")
@@ -655,48 +673,44 @@ class TmuxBridge:
                 self.running = False
 
     async def _main_loop(self):
-        """Read tmux control mode output from master PTY fd."""
+        """Read tmux control mode output from master PTY fd using add_reader."""
         if not hasattr(self, "_tmux_master_fd"):
             return
 
         loop = asyncio.get_event_loop()
-        buf = b""
+        self._read_buf = b""
+        self._main_loop_done = loop.create_future()
 
-        while self.running:
+        def on_readable():
             try:
-                # Wait for data on the master fd
-                await loop.run_in_executor(None, self._wait_for_read)
-
-                try:
-                    data = os.read(self._tmux_master_fd, 65536)
-                except (OSError, BlockingIOError):
-                    continue
-
-                if not data:
-                    info("tmux process ended")
-                    self.running = False
-                    break
-
-                buf += data
-
-                # Process complete lines
-                while b"\n" in buf:
-                    line_bytes, buf = buf.split(b"\n", 1)
-                    line = line_bytes.decode("latin-1").rstrip("\r")
-                    await self.parser.parse_line(line)
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                log("Parse error: " + str(e))
-
-    def _wait_for_read(self):
-        """Block until master fd is readable (runs in executor thread)."""
-        import select as sel
-        while self.running:
-            r, _, _ = sel.select([self._tmux_master_fd], [], [], 0.5)
-            if r:
+                data = os.read(self._tmux_master_fd, 65536)
+            except (OSError, BlockingIOError):
                 return
+            if not data:
+                info("tmux process ended")
+                self.running = False
+                if not self._main_loop_done.done():
+                    self._main_loop_done.set_result(None)
+                return
+
+            self._read_buf += data
+            # Process complete lines
+            while b"\n" in self._read_buf:
+                line_bytes, self._read_buf = self._read_buf.split(b"\n", 1)
+                line = line_bytes.decode("latin-1").rstrip("\r")
+                # Schedule parsing as a task so it doesn't block the reader
+                asyncio.ensure_future(self.parser.parse_line(line))
+
+        loop.add_reader(self._tmux_master_fd, on_readable)
+
+        try:
+            # Wait until the bridge stops or tmux exits
+            while self.running:
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            loop.remove_reader(self._tmux_master_fd)
 
     # ── Event handlers ──────────────────────────────────────────────────
 
@@ -711,6 +725,8 @@ class TmuxBridge:
             pane.active = False
 
     async def on_window_add(self, window_id):
+        if self.bootstrapping:
+            return
         log("Window added: " + window_id)
         await asyncio.sleep(0.3)
 
@@ -761,6 +777,8 @@ class TmuxBridge:
                 )
 
     async def on_layout_change(self, window_id, layout):
+        if self.bootstrapping:
+            return
         current_ids = extract_pane_ids_from_layout(layout)
         # Get ALL known pane IDs (not just this window) to filter false positives
         all_known_ids = {
@@ -853,16 +871,13 @@ class TmuxBridge:
             except OSError:
                 pass
 
-        proc = self.state.tmux_process
-        if proc:
+        tmux_pid = self.state.tmux_process
+        if tmux_pid:
             try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=5.0)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                os.kill(tmux_pid, signal.SIGTERM)
+                os.waitpid(tmux_pid, 0)
+            except (ProcessLookupError, ChildProcessError, OSError):
+                pass
 
         shutil.rmtree(self.state.socket_dir, ignore_errors=True)
         self.cmux.clear_status("tmux-bridge")
