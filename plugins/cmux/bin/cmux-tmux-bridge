@@ -67,12 +67,12 @@ class BridgeState:
     tmux_session: str
     socket_dir: str
     prefix: str
-    panes: dict = field(default_factory=dict)
-    windows: dict = field(default_factory=dict)
+    panes: dict = field(default_factory=dict)  # pane_id → PaneState
+    windows: dict = field(default_factory=dict)  # window_id → window_name
+    window_to_workspace: dict = field(default_factory=dict)  # window_id → cmux workspace ref
     original_workspace: str = ""
     tmux_process: object = None
-    # FIFO queue for command responses — tmux assigns its own cmd numbers
-    pending_responses: list = field(default_factory=list)  # list of asyncio.Future
+    pending_responses: list = field(default_factory=list)
 
 
 # ── cmux Manager ────────────────────────────────────────────────────────────
@@ -126,6 +126,17 @@ class CmuxManager:
 
     def select_workspace(self, ws_id: str):
         self._run(["select-workspace", "--workspace", ws_id])
+
+    def new_split_in_workspace(self, ws_id: str, direction: str = "down") -> str:
+        """Create a split in a workspace. Returns surface ref or empty string."""
+        output = self._run(["new-split", direction, "--workspace", ws_id])
+        # Output: "OK surface:58 workspace:10"
+        match = re.search(r"surface:\d+", output)
+        return match.group(0) if match else ""
+
+    def respawn_pane(self, surface_id: str, command: str):
+        """Respawn a surface with a specific command."""
+        self._run(["respawn-pane", "--surface", surface_id, "--command", command])
 
     def close_workspace(self, ws_id: str):
         try:
@@ -382,7 +393,8 @@ class TmuxBridge:
         if self.state.original_workspace:
             self.cmux.select_workspace(self.state.original_workspace)
 
-        info("Bridge active - " + str(pane_count) + " panes mapped to cmux workspaces")
+        ws_count = len(self.state.window_to_workspace)
+        info("Bridge active - " + str(pane_count) + " panes in " + str(ws_count) + " workspaces")
         info("Press Ctrl+C to detach")
 
         try:
@@ -396,6 +408,7 @@ class TmuxBridge:
     async def _bootstrap(self):
         log("Bootstrapping from existing session...")
 
+        # Discover windows
         windows_response = await self._send_tmux_command(
             "list-windows -F '#{window_id} #{window_name}'"
         )
@@ -407,10 +420,12 @@ class TmuxBridge:
                 elif len(parts) == 1:
                     self.state.windows[parts[0]] = "shell"
 
-        # Use -s (session panes only) instead of -a (all sessions)
+        # Discover panes, grouped by window
         panes_response = await self._send_tmux_command(
             "list-panes -s -F '#{pane_id} #{window_id} #{window_name}'"
         )
+        # Group panes by window
+        window_panes = {}  # window_id → [(pane_id, window_name), ...]
         if panes_response:
             for line in panes_response:
                 parts = line.strip("'").split(None, 2)
@@ -419,16 +434,55 @@ class TmuxBridge:
                     window_id = parts[1]
                     window_name = parts[2] if len(parts) > 2 else self.state.windows.get(window_id, "shell")
                     self.state.windows[window_id] = window_name
-                    await self._setup_pane(pane_id, window_id, window_name)
+                    if window_id not in window_panes:
+                        window_panes[window_id] = []
+                    window_panes[window_id].append((pane_id, window_name))
 
-        log("Bootstrap complete: " + str(len(self.state.panes)) + " panes")
+        # Create cmux workspaces per window, splits per pane within window
+        for window_id, panes in window_panes.items():
+            await self._setup_window(window_id, panes)
 
-    async def _setup_pane(self, pane_id, window_id, window_name):
+        log("Bootstrap complete: " + str(len(self.state.panes)) + " panes in "
+            + str(len(self.state.window_to_workspace)) + " workspaces")
+
+    async def _setup_window(self, window_id, panes):
+        """Create cmux workspaces for a tmux window's panes.
+
+        Each pane gets its own workspace. When a window has multiple panes,
+        they're named with indices: "tmux:editor", "tmux:editor [2]", etc.
+        """
+        if not panes:
+            return
+
+        window_name = panes[0][1]
+
+        for i, (pane_id, _) in enumerate(panes):
+            relay_cmd = self._make_relay_cmd(pane_id)
+            ws_id = self.cmux.create_workspace_with_command(relay_cmd)
+            if not ws_id:
+                info("Warning: Failed to create workspace for pane " + pane_id)
+                continue
+
+            # Name: "tmux:editor" for first, "tmux:editor [2]" for subsequent
+            if i == 0:
+                ws_name = self.state.prefix + window_name
+            else:
+                ws_name = self.state.prefix + window_name + " [" + str(i + 1) + "]"
+            self.cmux.rename_workspace(ws_id, ws_name)
+
+            if i == 0:
+                self.state.window_to_workspace[window_id] = ws_id
+
+            self._register_pane(pane_id, window_id, ws_id, "", window_name)
+
+    async def _setup_additional_pane(self, pane_id, window_id, ws_id, window_name):
+        """Add a split pane within an existing cmux workspace."""
         if pane_id in self.state.panes:
             return
 
-        log("Setting up pane " + pane_id)
+        log("Adding split for pane " + pane_id + " in workspace " + ws_id)
 
+        # 1. Create socket FIRST (relay needs it to exist on startup)
         safe_id = pane_id.lstrip("%")
         socket_path = os.path.join(self.state.socket_dir, "pane-" + safe_id + ".sock")
         srv_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -437,34 +491,80 @@ class TmuxBridge:
         srv_sock.listen(1)
         srv_sock.setblocking(False)
 
-        # Create workspace with relay command — this launches the relay directly
-        # in the new workspace's terminal, avoiding surface ID lookup issues
+        # 2. Select the workspace first (splits need focus to create real terminals)
+        self.cmux.select_workspace(ws_id)
+        await asyncio.sleep(0.3)
+
+        # 3. Create split
+        surface_id = self.cmux.new_split_in_workspace(ws_id, "down")
+        if not surface_id:
+            info("Warning: Failed to create split for pane " + pane_id)
+            srv_sock.close()
+            os.unlink(socket_path)
+            # Return to original workspace
+            if self.state.original_workspace:
+                self.cmux.select_workspace(self.state.original_workspace)
+            return
+
+        # 4. Wait for shell to initialize, then send relay command
+        await asyncio.sleep(2.0)
         relay_cmd = (
+            self.relay_path + " " + socket_path
+            + " --pane-id " + pane_id
+            + " --bridge-pid " + str(os.getpid()) + "\\n"
+        )
+        self.cmux.send_to_surface(surface_id, relay_cmd)
+
+        # 5. Return to original workspace
+        if self.state.original_workspace:
+            self.cmux.select_workspace(self.state.original_workspace)
+
+        # 4. Register state
+        self.state.panes[pane_id] = PaneState(
+            tmux_pane_id=pane_id,
+            tmux_window_id=window_id,
+            cmux_workspace_id=ws_id,
+            cmux_surface_id=surface_id,
+            socket_path=socket_path,
+            server_socket=srv_sock,
+            window_name=window_name,
+            active=True,
+        )
+        asyncio.create_task(self._accept_relay(pane_id))
+
+    def _make_relay_cmd(self, pane_id):
+        """Build the relay command string."""
+        safe_id = pane_id.lstrip("%")
+        socket_path = os.path.join(self.state.socket_dir, "pane-" + safe_id + ".sock")
+        return (
             self.relay_path + " " + socket_path
             + " --pane-id " + pane_id
             + " --bridge-pid " + str(os.getpid())
         )
-        ws_id = self.cmux.create_workspace_with_command(relay_cmd)
-        if ws_id:
-            ws_name = self.state.prefix + window_name
-            self.cmux.rename_workspace(ws_id, ws_name)
 
-            self.state.panes[pane_id] = PaneState(
-                tmux_pane_id=pane_id,
-                tmux_window_id=window_id,
-                cmux_workspace_id=ws_id,
-                cmux_surface_id="",  # Not needed with --command approach
-                socket_path=socket_path,
-                server_socket=srv_sock,
-                window_name=window_name,
-                active=True,
-            )
+    def _register_pane(self, pane_id, window_id, ws_id, surface_id, window_name):
+        """Create socket and register pane state."""
+        safe_id = pane_id.lstrip("%")
+        socket_path = os.path.join(self.state.socket_dir, "pane-" + safe_id + ".sock")
 
-            asyncio.create_task(self._accept_relay(pane_id))
-        else:
-            info("Warning: Failed to create workspace for pane " + pane_id)
-            srv_sock.close()
-            os.unlink(socket_path)
+        srv_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv_sock.bind(socket_path)
+        os.chmod(socket_path, 0o600)
+        srv_sock.listen(1)
+        srv_sock.setblocking(False)
+
+        self.state.panes[pane_id] = PaneState(
+            tmux_pane_id=pane_id,
+            tmux_window_id=window_id,
+            cmux_workspace_id=ws_id,
+            cmux_surface_id=surface_id,
+            socket_path=socket_path,
+            server_socket=srv_sock,
+            window_name=window_name,
+            active=True,
+        )
+
+        asyncio.create_task(self._accept_relay(pane_id))
 
     async def _accept_relay(self, pane_id):
         pane = self.state.panes.get(pane_id)
@@ -612,20 +712,22 @@ class TmuxBridge:
 
     async def on_window_add(self, window_id):
         log("Window added: " + window_id)
-        # Brief delay — tmux may not have the window fully ready
         await asyncio.sleep(0.3)
 
         response = await self._send_tmux_command(
             "list-panes -t " + window_id + " -F '#{pane_id} #{window_id} #{window_name}'"
         )
         if response:
+            panes = []
             for line in response:
                 parts = line.strip("'").split(None, 2)
                 if len(parts) >= 2:
                     pane_id = parts[0]
                     window_name = parts[2] if len(parts) > 2 else "shell"
                     self.state.windows[window_id] = window_name
-                    await self._setup_pane(pane_id, window_id, window_name)
+                    panes.append((pane_id, window_name))
+            if panes:
+                await self._setup_window(window_id, panes)
 
         pane_count = len([p for p in self.state.panes.values() if p.active])
         self.cmux.set_status(
@@ -660,16 +762,49 @@ class TmuxBridge:
 
     async def on_layout_change(self, window_id, layout):
         current_ids = extract_pane_ids_from_layout(layout)
-        known_ids = {
+        # Get ALL known pane IDs (not just this window) to filter false positives
+        all_known_ids = {
+            int(p.tmux_pane_id.lstrip("%"))
+            for p in self.state.panes.values()
+        }
+        window_known_ids = {
             int(p.tmux_pane_id.lstrip("%"))
             for p in self.state.panes.values()
             if p.tmux_window_id == window_id
         }
-        new_ids = current_ids - known_ids
-        if new_ids:
+        new_ids = current_ids - all_known_ids
+        if not new_ids:
+            return
+
+        # Verify new panes actually exist by querying tmux
+        log("Layout change detected " + str(len(new_ids)) + " potential new panes, verifying...")
+        response = await self._send_tmux_command(
+            "list-panes -t " + window_id + " -F '#{pane_id}'"
+        )
+        real_pane_ids = set()
+        if response:
+            for line in response:
+                pid = line.strip("'").strip()
+                if pid:
+                    real_pane_ids.add(int(pid.lstrip("%")))
+
+        verified_new = new_ids & real_pane_ids - all_known_ids
+        if verified_new:
             window_name = self.state.windows.get(window_id, "shell")
-            for pane_num in new_ids:
-                await self._setup_pane("%" + str(pane_num), window_id, window_name)
+            # Count existing panes in this window for numbering
+            existing_count = sum(
+                1 for p in self.state.panes.values()
+                if p.tmux_window_id == window_id
+            )
+            for i, pane_num in enumerate(sorted(verified_new)):
+                pane_id = "%" + str(pane_num)
+                relay_cmd = self._make_relay_cmd(pane_id)
+                ws_id = self.cmux.create_workspace_with_command(relay_cmd)
+                if ws_id:
+                    idx = existing_count + i + 1
+                    ws_name = self.state.prefix + window_name + " [" + str(idx) + "]"
+                    self.cmux.rename_workspace(ws_id, ws_name)
+                    self._register_pane(pane_id, window_id, ws_id, "", window_name)
 
     async def on_exit(self, reason):
         self.running = False
