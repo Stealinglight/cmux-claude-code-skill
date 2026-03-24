@@ -191,14 +191,25 @@ cmux clear-log
 
 ## Browser Automation
 
-The cmux embedded browser is WebKit-based (WKWebView). Control it entirely via the `cmux browser` CLI through the Bash tool.
+The cmux browser is WebKit (WKWebView). Use ONLY the `cmux browser` CLI via Bash.
+
+**Do NOT use Playwright MCP or Chrome DevTools MCP** — they run their own separate browsers and CANNOT connect to cmux's embedded browser.
+
+**CRITICAL: Every command after `open`/`open-split` MUST include `surface:<ID>`.** Commands like `cmux browser navigate <url>` WITHOUT a surface ID will fail.
+
+### Step 1: Open a browser surface
 
 ```bash
-# Navigation
-cmux browser open https://example.com               # new browser surface
-cmux browser open-split https://localhost:3000       # browser in split pane
-cmux browser surface:<ID> navigate 'https://example.com' --snapshot-after
-# ^ IMPORTANT: Quote the URL when using flags like --snapshot-after
+cmux browser open-split https://example.com
+# Returns: OK surface=surface:<ID> pane=pane:<ID> placement=split
+# Parse the surface ID (e.g. surface:28) — you need it for ALL subsequent commands
+```
+
+### Step 2: Use the surface ID for ALL browser commands
+
+```bash
+# Navigation — ALWAYS prefix with surface:<ID>
+cmux browser surface:<ID> navigate 'https://example.com'
 cmux browser surface:<ID> back
 cmux browser surface:<ID> forward
 cmux browser surface:<ID> reload
@@ -238,6 +249,31 @@ cmux browser surface:<ID> storage local set theme dark
 # Session persistence
 cmux browser surface:<ID> state save /tmp/browser-state.json
 cmux browser surface:<ID> state load /tmp/browser-state.json
+```
+
+**URL quoting**: When using flags like `--snapshot-after`, quote the URL: `navigate 'https://...' --snapshot-after`
+
+### Example: Open browser and inspect a page
+
+```bash
+# 1. Open browser split
+cmux browser open-split http://localhost:3000
+# Output: OK surface=surface:28 pane=pane:25 placement=split
+
+# 2. Wait for page to load (use the surface ID from step 1)
+cmux browser surface:28 wait --load-state complete --timeout-ms 15000
+
+# 3. Get page title
+cmux browser surface:28 get title
+
+# 4. Take a snapshot (DOM tree)
+cmux browser surface:28 snapshot --interactive --compact
+
+# 5. Click something
+cmux browser surface:28 click "button.submit" --snapshot-after
+
+# 6. Take a screenshot
+cmux browser surface:28 screenshot --out /tmp/page.png
 ```
 
 For the complete browser command reference, see `references/browser-automation.md`.
