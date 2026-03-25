@@ -40,6 +40,8 @@ is_in_cmux() {
 passthrough() {
     find_real_tmux || { echo "tmux: real tmux binary not found" >&2; exit 1; }
     debug "passthrough: $REAL_TMUX $*"
+    # Unset TMUX so real tmux uses its default socket (not "cmux-shim")
+    unset TMUX TMUX_PANE
     exec "$REAL_TMUX" "$@"
 }
 
@@ -69,6 +71,14 @@ set -- "${ARGS[@]}"
 # ── Parse the tmux subcommand ───────────────────────────────────────────────
 CMD="${1:-}"
 shift || true
+
+# Commands that should ALWAYS go to real tmux (session management, not pane control)
+case "$CMD" in
+    ls|list-sessions|list-clients|attach-session|attach|detach-client|detach|\
+    start-server|kill-server|info|source-file|source)
+        passthrough "$CMD" "$@"
+        ;;
+esac
 
 case "$CMD" in
 
