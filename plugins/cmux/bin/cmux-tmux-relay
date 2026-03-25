@@ -79,9 +79,24 @@ def main():
     stdout_fd = sys.stdout.fileno()
     old_settings = termios.tcgetattr(stdin_fd)
 
+    # Send terminal size as first message so bridge can set refresh-client
+    try:
+        rows, cols = os.get_terminal_size(stdout_fd)
+        size_header = f"SIZE:{rows}:{cols}\n".encode()
+        sock.sendall(size_header)
+        debug_log(f"Sent size: {rows}x{cols}", debug)
+    except (OSError, ValueError):
+        pass
+
     # Handle SIGWINCH (terminal resize)
     def on_winch(signum, frame):
         write_resize(args.socket_path, args.pane_id, args.bridge_pid)
+        # Also send updated size to bridge
+        try:
+            r, c = os.get_terminal_size(stdout_fd)
+            sock.sendall(f"SIZE:{r}:{c}\n".encode())
+        except (OSError, ValueError, BrokenPipeError):
+            pass
 
     signal.signal(signal.SIGWINCH, on_winch)
 

@@ -388,9 +388,11 @@ class TmuxBridge:
         # Give tmux a moment to send initial control mode output
         await asyncio.sleep(1.0)
 
-        # CRITICAL: Set client size so tmux sends %output notifications.
+        # CRITICAL: Set initial client size so tmux sends %output notifications.
         # Control mode clients are "headless" by default — no size = no output.
-        await self._send_tmux_command("refresh-client -C 200,50")
+        # Use a reasonable default; relays will send their actual size on connect
+        # and we'll call refresh-client again with the correct dimensions.
+        await self._send_tmux_command("refresh-client -C 120,40")
         await asyncio.sleep(0.3)
 
         await self._bootstrap()
@@ -609,6 +611,8 @@ class TmuxBridge:
             return
 
         loop = asyncio.get_event_loop()
+        size_buf = b""
+        got_size = False
 
         while self.running and pane.active:
             try:
@@ -616,6 +620,27 @@ class TmuxBridge:
                 if not data:
                     pane.active = False
                     break
+
+                # Handle SIZE header from relay (first message)
+                if not got_size:
+                    size_buf += data
+                    if b"\n" in size_buf:
+                        header, remainder = size_buf.split(b"\n", 1)
+                        header_str = header.decode("utf-8", errors="ignore")
+                        if header_str.startswith("SIZE:"):
+                            parts = header_str.split(":")
+                            if len(parts) == 3:
+                                rows, cols = parts[1], parts[2]
+                                log("Relay " + pane_id + " size: " + cols + "x" + rows)
+                                await self._send_tmux_command(
+                                    "refresh-client -C " + cols + "," + rows
+                                )
+                        got_size = True
+                        data = remainder
+                        if not data:
+                            continue
+                    else:
+                        continue
 
                 # Brief delay to batch rapid keystrokes
                 await asyncio.sleep(0.005)
@@ -630,6 +655,27 @@ class TmuxBridge:
                             break
                     except (BlockingIOError, OSError):
                         break
+
+                # Check for SIZE messages in the data (sent on resize)
+                if b"SIZE:" in data:
+                    lines = data.split(b"\n")
+                    input_parts = []
+                    for line in lines:
+                        line_str = line.decode("utf-8", errors="ignore")
+                        if line_str.startswith("SIZE:"):
+                            parts = line_str.split(":")
+                            if len(parts) == 3:
+                                rows, cols = parts[1], parts[2]
+                                log("Relay " + pane_id + " resized: " + cols + "x" + rows)
+                                await self._send_tmux_command_fire_and_forget(
+                                    "refresh-client -C " + cols + "," + rows
+                                )
+                        elif line:
+                            input_parts.append(line)
+                    if input_parts:
+                        data = b"\n".join(input_parts)
+                    else:
+                        continue
 
                 await self._send_input_to_tmux(pane_id, data)
 
